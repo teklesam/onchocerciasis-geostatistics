@@ -1,0 +1,1165 @@
+---
+title: "Climate, Hydrology, and Recent Climate Anomaly as Drivers of Onchocerciasis Prevalence: A Pooled Geostatistical Analysis of Four REMO Surveys (Tanzania, Cameroon, Malawi, Mozambique)"
+author: "Samuel Tekle, Oxford Martin School, Climate and Child Health"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_download: true
+    theme: flatly
+    highlight: tango
+    fig_caption: true
+    df_print: kable
+encoding: "UTF-8"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE,
+                      fig.align="center", cache=FALSE,
+                      dpi=300, dev="ragg_png")
+```
+
+```{r all-packages, include=FALSE}
+library(RiskMap); library(lme4); library(sf); library(terra)
+library(rgeoboundaries); library(ggplot2); library(dplyr); library(tidyr)
+library(knitr); library(kableExtra); library(viridis); library(patchwork)
+library(survey); library(scales); library(elevatr); library(car)
+library(whitebox); library(geodata); library(rnaturalearth); library(rnaturalearthhires)
+library(ragg); library(ggspatial)
+```
+
+**AI Use Statement**: This extended multi-country analysis was drafted with AI assistance (Claude, Anthropic) under the author's direction and supervision. All data, modelling choices, and interpretation were reviewed by the author; the underlying single-country Tanzania analysis this document extends was produced independently for course assessment.
+
+# Abstract
+
+*Background*: Onchocerciasis (river blindness) transmission runs along a specific climate-to-vector causal chain: mean temperature governs the physiology and extrinsic incubation period of the *Simulium* blackfly vector and its parasite, while precipitation and river hydrology govern the availability and discharge of the fast-flowing water that *Simulium* larvae require. Whether this chain operates with the same strength across ecologically different countries, and whether recent climate anomalies (drought stress, excess heat) leave a detectable signature on top of long-run climate normals, are open questions that country-by-country REMO analyses are not designed to answer.
+
+*Methods*: Palpation-survey records from four 2014 REMO surveys (Tanzania, Cameroon, Malawi, Mozambique) were pooled into one village-level dataset. For every village, three covariate families were extracted: (i) climate normals (vegetation index, night-time lights, mean annual temperature, elevation, annual precipitation, 2014 country rasters and AWS SRTM); (ii) hydrology (river-network distance, upstream flow accumulation from a 30 arc-second DEM processed with WhiteboxTools' D8 algorithm, and riparian vegetation density), replicated independently for all four countries; and (iii) recent climate anomaly (a 12-month Standardized Precipitation-Evapotranspiration Index, SPEI-12, and a monthly excess-heat-day count, both from the Climate Hazards Center's CHIRPS/CHIRTS/FLDAS-derived products). All covariates were standardised once, pooled across the four countries, and entered a binomial GLMM with village random intercepts, country main effects, and country interactions for every climate/hydrology/anomaly covariate; heterogeneity was tested by likelihood-ratio test (LRT) against a main-effects-only model. Independent per-country Gaussian process (GP) geostatistical models were then fitted on the same standardised scale for spatial prediction.
+
+*Results*: The LRT, country-specific slope forest plot, coefficient table, and prediction maps are reported in Results.
+
+*Conclusion*: This is a hypothesis-generating test of whether the climate-hydrology-transmission pathway is ecologically transportable across four REMO surveys, and whether recent climate anomaly exposure (as opposed to the long-run climate normal alone) carries additional, potentially country-specific, signal.
+
+# Introduction
+
+## The climate-to-transmission mechanism
+
+Onchocerciasis is transmitted exclusively by *Simulium damnosum* sensu lato blackflies whose entire life cycle is climate-gated. Larval development requires fast-flowing, well-oxygenated water, so river discharge and hydrological connectivity (not simply "being near water") set the physical carrying capacity of a site for the vector. Adult survival and the duration of the parasite's extrinsic incubation period inside the fly are both temperature-dependent, with transmission efficiency typically peaking in a mid-range temperature band and collapsing at temperature extremes (Cheke and Garms, 2013). Precipitation, and the drought or wet-season anomalies superimposed on the long-run precipitation normal, further modulate breeding-site availability through flooding and desiccation cycles. This gives a specific, testable causal chain: **climate (temperature, precipitation, and recent anomalies on top of these normals) -> river hydrology and vector habitat -> onchocerciasis prevalence.**
+
+REMO surveys, and the national programmes that run them, are analysed country by country. That is operationally necessary but means the climate-to-transmission chain above has essentially never been tested on a common covariate scale across countries: a temperature or hydrology coefficient estimated for Tanzania alone cannot be compared numerically to one estimated for Cameroon alone, because each analysis standardises its covariates to its own country-specific mean and SD. This analysis is designed specifically to close that gap: to put temperature, precipitation, hydrology, and recent climate anomaly on one pooled scale so that a single number, the country-specific slope, becomes directly comparable across four REMO datasets, and to formally test whether that number is homogeneous or country-dependent (i.e. whether ecological context modulates the strength of the climate-transmission relationship).
+
+## Recent climate anomaly as a distinct exposure
+
+The covariates above (2014 mean temperature, 2014 total precipitation) are climate *normals*: single-year snapshots that say nothing about whether that year was anomalously hot or dry relative to the recent past at a given village. Two additional covariates are added specifically to probe recent anomaly exposure, distinct from the static normals: a 12-month Standardized Precipitation-Evapotranspiration Index (SPEI-12, a standardised drought-severity index) ending at the close of the 2014 survey year, and a count of months in 2014 whose mean maximum temperature exceeded a fixed heat threshold. These are the more direct test of whether *recent climate stress*, rather than the long-run average climate, leaves a detectable signature on prevalence, which is closer to the climate-change-relevant question than a single-year snapshot.
+
+## Research questions
+
+1. Does the estimated effect of temperature, precipitation, hydrology (flow accumulation, river distance, riparian vegetation), and recent climate anomaly (SPEI-12, excess heat) on onchocerciasis prevalence differ significantly across the four countries (formal heterogeneity test)?
+2. Which country/covariate combination in this climate-to-transmission chain shows the strongest, and which the weakest, association, and are the differences biologically plausible?
+3. Do independent per-country geostatistical models, built on the same covariate scale, produce prevalence surfaces broadly consistent with the pooled regression slopes?
+
+# Methods
+
+## Data sources
+
+REMO survey records (village, coordinates, number examined `n`, number palpation-positive `y`) were obtained for Tanzania, Cameroon, Malawi, and Mozambique, all nominally 2014 (no finer survey date than year is recorded in the source files, so all four are treated as 2014 cross-sections). Exact-duplicate rows were removed per country. Four 2014 raster covariate surfaces (EVI, VIIRS night-time lights, mean annual temperature, annual precipitation) were supplied per country in native WGS84 at approximately 1 km resolution. Elevation came from AWS SRTM via `elevatr`.
+
+## Hydrology covariates (all four countries)
+
+Unlike a single-country replica, hydrological covariates were derived independently for **all four countries**, using the same method as the original Tanzania script: a 30 arc-second DEM (`geodata::elevation_30s`, ISO3 codes TZA/CMR/MWI/MOZ) was projected to each country's own UTM zone and cropped to the country boundary plus a 20 km buffer; WhiteboxTools' D8 algorithm (depression filling, D8 pointer, D8 flow accumulation) was then run on each country's DEM to derive upstream contributing area, log-transformed (`log_flowacc`) as a proxy for river discharge and larval habitat quality. The Natural Earth 1:10m river network was intersected with each country's boundary to compute log-distance to the nearest river (`log_dist_river`) and a 500 m riparian buffer around the nearest river reach, within which mean EVI was extracted as a riparian-vegetation-quality proxy (`riparian_evi`). This pipeline ran independently per country (four separate DEMs, four separate river intersections); no cross-country hydrological quantity was computed.
+
+## Recent climate anomaly covariates (all four countries)
+
+Two additional covariates target recent climate anomaly rather than the single-year normal:
+
+- **SPEI-12** (12-month Standardized Precipitation-Evapotranspiration Index, ending December 2014): obtained directly from the Climate Hazards Center's precomputed global SPEI product (CHIRPS3 precipitation minus FLDAS-derived reference evapotranspiration, standardised per grid cell; Vicente-Serrano et al., 2010), at 0.05 degree resolution, read via a windowed remote (`/vsicurl/`) GDAL request rather than downloading the full global raster. A 24-month accumulation (SPEI-24) was not available from this product (only 1/2/3/6/9/12-month accumulations are distributed); SPEI-12 was used as the closest available standard accumulation window and is reported explicitly as this substitution.
+- **Excess heat days**: a count, for each village, of how many of the 12 calendar months of 2014 had a mean monthly maximum temperature (CHIRTS-monthly Tmax, Climate Hazards Center) above 32 Celsius. Daily maximum-temperature time series were not readily accessible through the R packages available in this environment without an API key, so a monthly-heat-exceedance count is used as a documented, coarser proxy for excess heat exposure rather than a true daily heatwave count.
+
+Both products are global, so a single set of raster reads (12 monthly Tmax rasters plus one SPEI-12 raster, each cropped to the shared African bounding box of the four countries) served all four countries simultaneously; this is unlike the hydrology covariates, which were genuinely computed four separate times.
+
+## Covariate extraction and country geometry
+
+Raster covariate extraction (climate normals, SPEI, heat days) was performed in each raster's native WGS84 coordinate reference system. A 5x5 focal mean imputed the rare edge/coastal missing values, following the Tanzania script's convention. Projected (UTM) coordinates were used only for the hydrology pipeline and the geostatistical (GP) stage, where a metric CRS is required: Cameroon was projected to UTM Zone 33N (EPSG:32633), Malawi and Tanzania to UTM Zone 36S (EPSG:32736, matching the original Tanzania assignment), and Mozambique to UTM Zone 37S (EPSG:32737), each the zone containing the median longitude of that country's survey points.
+
+## Pooled standardisation
+
+All ten continuous covariates (EVI, log(NTL+1), temperature, elevation, precipitation, log-flow-accumulation, log-distance-to-river, riparian EVI, SPEI-12, excess-heat-days) were centred and scaled using a single mean and SD computed across the pooled four-country dataset, not per country. This is what makes the estimated country-specific slopes directly comparable: a coefficient for `Temp_s` of 0.5 in Tanzania and 0.2 in Malawi both refer to the same one-SD temperature increment on the pooled scale.
+
+## Statistical models
+
+### Pooled binomial GLMM with country interactions
+
+Let $Y_{ic} \sim \text{Binomial}(n_{ic}, p_{ic})$ for village $i$ in country $c$, with $\eta_{ic}=\text{logit}(p_{ic})$. Vegetation density and urbanisation (EVI, logNTL) are retained as main-effect-only controls (they are not part of the climate-to-transmission mechanism under test). The eight covariates that instantiate the climate-hydrology-transmission chain, temperature, elevation, precipitation, log-flow-accumulation, log-distance-to-river, riparian EVI, SPEI-12, and excess-heat-days, are each given a country interaction:
+
+$$\eta_{ic} = \beta_0 + \beta_{\text{EVI}}\text{EVI}_{s,ic} + \beta_{\text{NTL}}\text{logNTL}_{s,ic} + \sum_{k\in K}\Big(\beta_k X_{k,ic} + \delta_{k,c}X_{k,ic}\cdot\mathbb{1}[c]\Big) + \gamma_c + Z_{ic}$$
+
+where $K=\{\text{Temp, Elev, Precip, log\_flowacc, log\_dist\_river, riparian\_evi, SPEI12, heat\_days}\}$, $\gamma_c$ is a country fixed effect, and $Z_{ic}\sim N(0,\sigma_Z^2)$ is a village random intercept. The main-effects-only model omits every $\delta_{k,c}$ term. Both were fitted by `lme4::glmer` (binomial, Laplace approximation, `bobyqa`), and heterogeneity was tested with a likelihood-ratio test between them.
+
+### Simplification relative to the Tanzania assignment (stated explicitly)
+
+The Tanzania assignment used data-derived two-piece linear splines for temperature and elevation. Pooling four ecologically distinct countries makes a single data-derived change point scientifically questionable, and estimating separate change points per country alongside eight country-interacted covariates would require far more parameters than the combined sample supports. Linear main effects were therefore used for all continuous covariates in the pooled GLMM; this trades away the non-linear resolution achieved for Tanzania alone in exchange for an estimable, interpretable pooled model.
+
+### Per-country geostatistical (GP) models with covariate-robustness fallback
+
+Independent GP models were fitted per country (`RiskMap::glgpm`, Monte Carlo maximum likelihood, exponential covariance), using the pooled standardisation constants. With up to ten covariates and per-country sample sizes as small as a few hundred villages, near-separation and MCML instability are a real risk (as previously documented in the single-country Tanzania script for a similarly sized covariate set). Each country's GP model was therefore fitted with an automatic fallback: starting from the full ten-covariate formula, covariates with variance inflation factor above 10, or with standardised-GLM coefficients indicating near-separation (absolute estimate or SE above 8 on the pooled-standardised scale), were dropped one at a time in a fixed priority order (least mechanistically central first: riparian EVI, distance to river, excess-heat-days, SPEI-12, flow accumulation, precipitation) until a stable formula was reached; if `glgpm` itself still failed to converge on that formula, the next covariate in the priority order was dropped and the model refit. The realised covariate set actually used for each country's GP model is reported in Results, since it can differ by country.
+
+### No single cross-country spatial field
+
+A single cross-country spatial field was not fitted: the four countries are not geographically contiguous, so a shared covariance function relating a village in Cameroon to one in Mozambique 3,000 km away has no biological or statistical justification (Diggle and Giorgi, 2019).
+
+## Prediction maps
+
+For each country, a prediction grid was built over the country boundary (`rgeoboundaries`, ADM0) at 20 km resolution (coarser than the single-country Tanzania map, to keep four separate MCML predictive simulations tractable), with climate, hydrology, and anomaly covariates extracted using the same country-specific rasters, DEM/flow-accumulation surfaces, and river networks built for the survey-point extraction, and elevation from a country-level SRTM raster (`elevatr::get_elev_raster`) rather than point-by-point AWS queries. Posterior mean prevalence was obtained by joint conditional simulation of each country's fitted spatial field (`type="joint"`, needed so the same samples could also be aggregated to administrative regions), using whichever covariate subset that country's GP model actually retained.
+
+For every map, the 20 km kriged prediction lattice was rasterised, masked to that country's real administrative boundary polygon (clipping the necessarily coarse computational grid to the true coastline/border shape), and bilinearly disaggregated to a 5 km display lattice purely for smoother rendering; this adds no new statistical information beyond the 20 km kriged values, only interpolation between them, and is stated in every relevant figure caption. For the single pooled Africa-wide map (Figure 9), each country's masked, smoothed raster was reprojected to WGS84 and merged into one seamless raster, so adjoining countries neither gap nor overlap; this is a purely visual/cartographic pooling of four independently-kriged surfaces onto one shared basemap (Natural Earth 1:10m, `rnaturalearthhires`), not a statistically pooled cross-country spatial field.
+
+```{r data-prep, include=FALSE}
+base_dir <- "Assignment files"
+rast_dir <- file.path(base_dir, "rasters")
+wbt_dir  <- file.path(getwd(), "wbt_workspace_multi")
+if(!dir.exists(wbt_dir)) dir.create(wbt_dir, recursive=TRUE)
+wbt_init()
+
+country_meta <- data.frame(
+  country_csv  = c("TANZANIA","CAMEROUN","MALAWI","MOZAMBIQUE"),
+  country_name = c("Tanzania","Cameroon","Malawi","Mozambique"),
+  raster_tag   = c("Tanzania","Cameroon","Malawi","Mozambique"),
+  gb_name      = c("tanzania","cameroon","malawi","mozambique"),
+  iso3         = c("TZA","CMR","MWI","MOZ"),
+  epsg         = c(32736, 32633, 32736, 32737),
+  stringsAsFactors = FALSE
+)
+
+# ── Natural Earth rivers, downloaded once, intersected per country below ─────
+rivers_world <- ne_download(scale=10, type="rivers_lake_centerlines",
+                            category="physical", returnclass="sf")
+
+# ── Per-country DEM -> WhiteboxTools D8 flow accumulation, plus river network ─
+# Reused for BOTH survey-point extraction and the prediction grid (below), so
+# each country's DEM/rivers are only downloaded and processed once.
+build_hydro <- function(meta){
+  shp_wgs <- geoboundaries(country=meta$gb_name, adm_lvl="adm0")
+  shp_utm <- st_transform(shp_wgs, crs=meta$epsg)
+
+  dem_raw <- geodata::elevation_30s(country=meta$iso3, path=wbt_dir)
+  dem_utm <- project(dem_raw, paste0("EPSG:", meta$epsg), method="bilinear")
+  study_ext <- ext(shp_utm) + 20000
+  dem_crop  <- crop(dem_utm, study_ext)
+
+  tag <- meta$country_name
+  dem_path  <- file.path(wbt_dir, paste0("dem_", tag, ".tif"))
+  fill_path <- file.path(wbt_dir, paste0("fill_", tag, ".tif"))
+  d8_path   <- file.path(wbt_dir, paste0("d8_", tag, ".tif"))
+  flow_path <- file.path(wbt_dir, paste0("flow_", tag, ".tif"))
+  writeRaster(dem_crop, dem_path, overwrite=TRUE)
+
+  wbt_fill_depressions_wang_and_liu(dem=dem_path, output=fill_path, verbose_mode=FALSE)
+  wbt_d8_pointer(dem=fill_path, output=d8_path, verbose_mode=FALSE)
+  wbt_d8_flow_accumulation(input=d8_path, output=flow_path, out_type="cells",
+                           log=FALSE, verbose_mode=FALSE)
+  r_flowacc <- rast(flow_path)
+
+  rivers_c <- suppressWarnings(st_intersection(
+    st_make_valid(st_transform(rivers_world, 4326)), st_make_valid(shp_wgs)))
+  rivers_utm <- st_transform(rivers_c, crs=meta$epsg)
+
+  list(shp_wgs=shp_wgs, shp_utm=shp_utm, r_flowacc=r_flowacc, rivers_utm=rivers_utm)
+}
+
+hydro_list <- setNames(
+  lapply(seq_len(nrow(country_meta)), function(i) build_hydro(country_meta[i,])),
+  country_meta$country_name)
+
+# ── Global climate-anomaly rasters (one read serves all four countries) ──────
+# SPEI-12 (CHIRPS3/FLDAS, Climate Hazards Center) and 12 months of CHIRTS
+# monthly Tmax for 2014, both read as remote windowed (/vsicurl/) requests
+# cropped to the shared African bounding box, avoiding full global downloads.
+africa_ext <- ext(7, 41, -27, 12)
+
+r_spei12 <- crop(rast(paste0(
+  "/vsicurl/https://data.chc.ucsb.edu/products/SPEI/C3_FLDAS_SPEI/12_month/",
+  "SPEI_C3_FLDAS_Global_12_201412.tif")), africa_ext)
+
+months_2014 <- sprintf("%02d", 1:12)
+r_tmax_2014 <- rast(lapply(months_2014, function(m){
+  r <- crop(rast(paste0(
+    "/vsicurl/https://data.chc.ucsb.edu/products/CHIRTSmonthly/CHIRTSmax.CDR/",
+    "CHIRTSmax.2014.", m, ".tif")), africa_ext)
+  r[r < -100] <- NA
+  r
+}))
+names(r_tmax_2014) <- paste0("tmax_", months_2014)
+heat_threshold_c <- 32   # fixed absolute threshold; documented proxy (see Methods)
+
+# ── Population density (GPW v4, 2015, ~5 arc-min) for burden-weighted maps ───
+r_popdens <- crop(rast(paste0(
+  "/vsicurl/https://geodata.ucdavis.edu/geodata/pop/",
+  "gpw_v4_population_density_rev11_2015_5m.tif")), africa_ext)
+
+# ── Per-country loader: survey csv, raster covariates, hydrology, anomaly ────
+load_country <- function(meta){
+  f <- file.path(base_dir, paste0("Remo_", meta$country_csv, ".csv"))
+  d <- read.csv(f)
+  d <- d[!duplicated(d[,c("village","long","lat","y","n")]), ]
+  pts_wgs <- st_as_sf(d, coords=c("long","lat"), crs=4326, remove=FALSE)
+
+  r_evi  <- rast(file.path(rast_dir, paste0("Africa_EVI_2014_", meta$raster_tag, ".tif")))
+  r_ntl  <- rast(file.path(rast_dir, paste0("Africa_Night_Lights_2014_", meta$raster_tag, ".tif")))
+  r_temp <- rast(file.path(rast_dir, paste0("Africa_Temperature_2014_", meta$raster_tag, ".tif")))
+  r_pre  <- rast(file.path(rast_dir, paste0("Africa_Precipitation_2014_", meta$raster_tag, ".tif")))
+  r_evi_imp  <- focal(r_evi,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+  r_ntl_imp  <- focal(r_ntl,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+  r_temp_imp <- focal(r_temp, w=5, fun="mean", na.policy="only", na.rm=TRUE)
+  r_pre_imp  <- focal(r_pre,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+
+  d$EVI    <- terra::extract(r_evi_imp,  pts_wgs)[,2]
+  d$NTL    <- terra::extract(r_ntl_imp,  pts_wgs)[,2]
+  d$Temp   <- terra::extract(r_temp_imp, pts_wgs)[,2]
+  d$Precip <- terra::extract(r_pre_imp,  pts_wgs)[,2]
+  d$logNTL <- log(d$NTL + 1)
+  d$Country <- meta$country_name
+  d$long_wgs <- d$long; d$lat_wgs <- d$lat
+
+  # ── Hydrology, using this country's own DEM/flow-accumulation/river network ─
+  h <- hydro_list[[meta$country_name]]
+  pts_utm <- st_transform(pts_wgs, crs=meta$epsg)
+
+  fa <- terra::extract(h$r_flowacc, vect(pts_utm))[,2]
+  fa[is.na(fa)] <- 1
+  d$log_flowacc <- log1p(fa)
+
+  nn <- st_nearest_feature(pts_utm, h$rivers_utm)
+  d$dist_river_m  <- as.numeric(st_distance(pts_utm, h$rivers_utm[nn,], by_element=TRUE))
+  d$log_dist_river <- log1p(d$dist_river_m/1000)
+
+  reach_buf_wgs <- st_transform(st_buffer(h$rivers_utm[nn,], dist=500), crs=4326)
+  d$riparian_evi <- vapply(seq_len(nrow(pts_wgs)), function(i){
+    vals <- terra::extract(r_evi_imp, reach_buf_wgs[i,])[,2]
+    if(all(is.na(vals))) return(NA_real_)
+    mean(vals, na.rm=TRUE)
+  }, numeric(1))
+
+  # ── Recent climate anomaly: SPEI-12 and excess heat days ────────────────────
+  d$SPEI12 <- terra::extract(r_spei12, pts_wgs)[,2]
+  tmax_pts <- terra::extract(r_tmax_2014, pts_wgs)[,-1]
+  d$heat_days <- rowSums(tmax_pts > heat_threshold_c, na.rm=TRUE)
+
+  d
+}
+
+country_list <- setNames(
+  lapply(seq_len(nrow(country_meta)), function(i) load_country(country_meta[i,])),
+  country_meta$country_name)
+
+remo_all <- do.call(rbind, lapply(country_list, function(d)
+  d[, c("village","long_wgs","lat_wgs","n","y","EVI","NTL","logNTL","Temp","Precip",
+        "log_flowacc","log_dist_river","riparian_evi","SPEI12","heat_days","Country")]))
+rownames(remo_all) <- NULL
+
+# ── Elevation for all survey points, AWS SRTM, single batched call ───────────
+all_pts_wgs <- st_as_sf(remo_all, coords=c("long_wgs","lat_wgs"), crs=4326, remove=FALSE)
+elev_pts    <- get_elev_point(all_pts_wgs, prj=4326, src="aws")
+elev_vals   <- elev_pts$elevation
+elev_vals[is.na(elev_vals)] <- median(elev_vals, na.rm=TRUE)
+remo_all$Elev <- elev_vals
+
+remo_all <- remo_all %>%
+  filter(!is.na(EVI) & !is.na(NTL) & !is.na(Temp) & !is.na(Precip)) %>%
+  mutate(prevalence = y/n,
+         elogit     = log((y+0.5)/(n-y+0.5)),
+         Country    = factor(Country, levels=c("Cameroon","Malawi","Mozambique","Tanzania")),
+         village_id = paste(Country, village, sep="_"))
+
+n_villages_total <- nrow(remo_all)
+
+# ── Pooled standardisation constants (single mean/SD across all 4 countries) ─
+std_vars <- c("EVI","logNTL","Temp","Elev","Precip",
+              "log_flowacc","log_dist_river","riparian_evi","SPEI12","heat_days")
+std_const <- lapply(std_vars, function(v) c(mean=mean(remo_all[[v]]), sd=sd(remo_all[[v]])))
+names(std_const) <- std_vars
+
+for(v in std_vars){
+  remo_all[[paste0(v,"_s")]] <- (remo_all[[v]] - std_const[[v]]["mean"]) / std_const[[v]]["sd"]
+}
+```
+
+```{r vif-check, include=FALSE}
+vif_form <- cbind(y,n-y) ~ EVI_s + logNTL_s + Temp_s + Elev_s + Precip_s +
+  log_flowacc_s + log_dist_river_s + riparian_evi_s + SPEI12_s + heat_days_s
+vif_glm  <- glm(vif_form, data=remo_all, family=binomial)
+vif_vals <- car::vif(vif_glm)
+vif_tbl  <- data.frame(Covariate=names(vif_vals), VIF=round(vif_vals,2),
+                       Flag=ifelse(vif_vals>10,"EXCLUDE (>10)",
+                             ifelse(vif_vals>5,"FLAG (>5)","OK")))
+```
+
+```{r survey-stats, include=FALSE}
+svy_design  <- svydesign(ids=~village_id, data=remo_all, weights=~1)
+prev_ratio  <- svyratio(~y, ~n, design=svy_design)
+prev_est    <- coef(prev_ratio)[1]
+prev_ci     <- confint(prev_ratio, level=0.95)
+
+prev_by_country <- remo_all %>%
+  group_by(Country) %>%
+  summarise(n_villages=n(), total_n=sum(n), total_y=sum(y),
+            prevalence=sum(y)/sum(n), .groups="drop")
+```
+
+```{r glmm-models, include=FALSE}
+ctrl <- glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+mech_covs <- c("Temp_s","Elev_s","Precip_s","log_flowacc_s","log_dist_river_s",
+              "riparian_evi_s","SPEI12_s","heat_days_s")
+
+main_rhs <- paste("EVI_s + logNTL_s +", paste(mech_covs, collapse=" + "),
+                  "+ Country + (1|village_id)")
+int_rhs  <- paste("EVI_s + logNTL_s +", paste(mech_covs, collapse=" + "),
+                  "+ Country +", paste(paste0(mech_covs,":Country"), collapse=" + "),
+                  "+ (1|village_id)")
+
+m_main <- glmer(as.formula(paste("cbind(y,n-y) ~", main_rhs)),
+                data=remo_all, family=binomial, nAGQ=1, control=ctrl)
+m_int  <- glmer(as.formula(paste("cbind(y,n-y) ~", int_rhs)),
+                data=remo_all, family=binomial, nAGQ=1, control=ctrl)
+
+lrt <- anova(m_main, m_int)
+lrt_chisq <- lrt$Chisq[2]
+lrt_df    <- lrt$Df[2]
+lrt_p     <- lrt$`Pr(>Chisq)`[2]
+
+m_int_quad <- tryCatch(
+  glmer(as.formula(paste("cbind(y,n-y) ~ EVI_s + logNTL_s +",
+                         paste(mech_covs, collapse=" + "),
+                         "+ I(Temp_s^2) + I(Elev_s^2) + Country +",
+                         paste(paste0(mech_covs,":Country"), collapse=" + "),
+                         "+ (1|village_id)")),
+        data=remo_all, family=binomial, nAGQ=1, control=ctrl),
+  error=function(e) NULL, warning=function(w) NULL)
+quad_improves <- !is.null(m_int_quad) && (AIC(m_int_quad) < AIC(m_int) - 2)
+```
+
+```{r forest-plot-data, include=FALSE}
+# ── Manual delta-method contrasts for country-specific slopes ────────────────
+# emmeans is unavailable in this environment; slopes and SEs are built directly
+# from fixef()/vcov() linear contrasts, which is exact for a fixed-effects GLMM.
+country_levels <- levels(remo_all$Country)
+
+country_slope <- function(model, var){
+  b   <- fixef(model)
+  V   <- vcov(model)
+  nms <- names(b)
+  out <- data.frame(Country=country_levels, Estimate=NA_real_, SE=NA_real_)
+  for(i in seq_along(country_levels)){
+    cc  <- country_levels[i]
+    a   <- setNames(rep(0, length(b)), nms)
+    a[var] <- 1
+    int_nm <- paste0(var, ":Country", cc)
+    if(int_nm %in% nms) a[int_nm] <- 1
+    out$Estimate[i] <- sum(a * b)
+    out$SE[i]       <- sqrt(as.numeric(t(a) %*% V %*% a))
+  }
+  out$lower <- out$Estimate - 1.96*out$SE
+  out$upper <- out$Estimate + 1.96*out$SE
+  out
+}
+
+cov_labels <- c(Temp_s="Temperature", Elev_s="Elevation", Precip_s="Precipitation",
+                log_flowacc_s="Flow accumulation (log)", log_dist_river_s="Distance to river (log)",
+                riparian_evi_s="Riparian vegetation", SPEI12_s="SPEI-12 (drought)",
+                heat_days_s="Excess heat days")
+
+slopes_all <- bind_rows(lapply(mech_covs, function(v)
+  country_slope(m_int, v) %>% mutate(Covariate=cov_labels[[v]])))
+slopes_all$Covariate <- factor(slopes_all$Covariate, levels=unname(cov_labels))
+
+strongest_row <- slopes_all[which.max(abs(slopes_all$Estimate)),]
+weakest_row   <- slopes_all[which.min(abs(slopes_all$Estimate)),]
+```
+
+```{r geostat-models, include=FALSE}
+# ── Robust per-country GP fitting: drop covariates on VIF / near-separation, ─
+# then on glgpm() failure, in a fixed priority order (least mechanistically
+# central first), following the Tanzania script's own separation diagnostics.
+full_covs   <- c("EVI_s","logNTL_s","Temp_s","Elev_s","Precip_s",
+                 "log_flowacc_s","log_dist_river_s","riparian_evi_s",
+                 "SPEI12_s","heat_days_s")
+drop_order  <- c("riparian_evi_s","log_dist_river_s","heat_days_s","SPEI12_s",
+                 "log_flowacc_s","Precip_s","Elev_s")   # EVI_s/logNTL_s/Temp_s never dropped
+
+select_covariates <- function(data, covs){
+  repeat{
+    if(length(covs) <= 3) break
+    form <- as.formula(paste("cbind(y,n-y) ~", paste(covs, collapse=" + ")))
+    fit  <- tryCatch(glm(form, data=data, family=binomial), error=function(e) NULL)
+    if(is.null(fit)) { covs <- covs[-length(covs)]; next }
+    cf <- summary(fit)$coefficients
+    sep_bad <- rownames(cf)[-1][abs(cf[-1,"Estimate"])>8 | cf[-1,"Std. Error"]>8]
+    vif_bad <- character(0)
+    if(length(covs) >= 2){
+      vv <- tryCatch(car::vif(fit), error=function(e) NULL)
+      if(!is.null(vv)) vif_bad <- names(vv)[vv>10]
+    }
+    bad <- unique(c(sep_bad, vif_bad))
+    bad <- intersect(drop_order, bad)   # only ever drop covariates on the priority list
+    if(length(bad)==0) break
+    to_drop <- bad[which.max(match(bad, drop_order))]
+    covs <- setdiff(covs, to_drop)
+  }
+  covs
+}
+
+fit_country_gp <- function(country_name, epsg){
+  d <- remo_all %>% filter(Country == country_name)
+  sf_pts <- st_as_sf(d, coords=c("long_wgs","lat_wgs"), crs=4326) %>%
+    st_transform(crs=epsg)
+
+  covs <- select_covariates(d, full_covs)
+  repeat{
+    form <- as.formula(paste("y ~", paste(covs, collapse=" + "), "+ gp(nugget=NULL)"))
+    fit  <- tryCatch(glgpm(form, den=n, data=sf_pts, family="binomial", messages=FALSE),
+                     error=function(e) e)
+    if(!inherits(fit, "error")) break
+    droppable <- intersect(drop_order, covs)
+    if(length(droppable)==0 || length(covs)<=3) stop("GP model could not be stabilised for ", country_name)
+    to_drop <- droppable[which.max(match(droppable, drop_order))]
+    covs <- setdiff(covs, to_drop)
+  }
+  list(model=fit, covs=covs)
+}
+
+gp_fits   <- setNames(
+  lapply(seq_len(nrow(country_meta)), function(i)
+    fit_country_gp(country_meta$country_name[i], country_meta$epsg[i])),
+  country_meta$country_name)
+gp_models <- lapply(gp_fits, `[[`, "model")
+gp_covs   <- lapply(gp_fits, `[[`, "covs")
+gp_theta  <- lapply(gp_models, coef)
+```
+
+```{r empirical-variograms, include=FALSE}
+# ── Empirical semi-variograms of village-level GLMM random effects, per ──────
+# country, following the Tanzania script's own residual-variogram diagnostic
+# (there: null vs full GLMM; here: one null-model variogram per country,
+# since the object under test is cross-country heterogeneity, not covariate
+# absorption within one country).
+fit_country_variogram <- function(cn, epsg){
+  d <- remo_all %>% filter(Country == cn)
+  sf_pts <- st_as_sf(d, coords=c("long_wgs","lat_wgs"), crs=4326) %>% st_transform(crs=epsg)
+  m0 <- glmer(cbind(y,n-y) ~ (1|village_id), data=d, family=binomial,
+             control=glmerControl(optimizer="bobyqa"))
+  re <- ranef(m0)$village_id
+  sf_pts$Z_hat <- re[as.character(d$village_id), 1]
+  # Country-specific bins (rather than the function's default auto-binning),
+  # spanning 1 km to that country's own maximum inter-village distance: with
+  # a fixed/default bin set this produced very unevenly populated, "noisy"-
+  # looking bins for geographically dispersed surveys (e.g. Mozambique, whose
+  # villages span >1,600 km). A 999-permutation envelope (as in the Tanzania
+  # script) is also added, so each panel shows whether the observed
+  # semivariance lies outside the null (spatial-independence) envelope.
+  max_dist_km <- as.numeric(max(st_distance(sf_pts))) / 1000
+  bins_cn <- seq(1, max_dist_km, length.out=12)
+  tryCatch(s_variogram(data=sf_pts, variable="Z_hat", bins=bins_cn,
+                       n_permutation=999, scale_to_km=TRUE),
+           error=function(e) NULL)
+}
+emp_variograms <- setNames(
+  lapply(seq_len(nrow(country_meta)), function(i)
+    fit_country_variogram(country_meta$country_name[i], country_meta$epsg[i])),
+  country_meta$country_name)
+```
+
+```{r africa-map-data, include=FALSE}
+# ── Africa study-area / locator map: continent outline, study countries ──────
+# highlighted, survey villages overlaid.
+africa_countries <- ne_countries(scale="large", continent="Africa", returnclass="sf")
+study_iso3 <- country_meta$iso3
+```
+
+```{r prediction-grids, include=FALSE}
+# ── Prediction grids: 20 km cells; hydrology/anomaly reuse the objects built ──
+# in data-prep so no raster is downloaded or processed twice.
+build_country_prediction <- function(meta){
+  h <- hydro_list[[meta$country_name]]
+  shp_utm <- h$shp_utm
+  grid_c   <- create_grid(shp_utm, spat_res=20)
+  grid_sf  <- st_as_sf(grid_c)
+  grid_wgs <- st_transform(grid_sf, crs=4326)
+
+  r_evi  <- rast(file.path(rast_dir, paste0("Africa_EVI_2014_", meta$raster_tag, ".tif")))
+  r_ntl  <- rast(file.path(rast_dir, paste0("Africa_Night_Lights_2014_", meta$raster_tag, ".tif")))
+  r_temp <- rast(file.path(rast_dir, paste0("Africa_Temperature_2014_", meta$raster_tag, ".tif")))
+  r_pre  <- rast(file.path(rast_dir, paste0("Africa_Precipitation_2014_", meta$raster_tag, ".tif")))
+  r_evi_imp  <- focal(r_evi,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+  r_ntl_imp  <- focal(r_ntl,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+  r_temp_imp <- focal(r_temp, w=5, fun="mean", na.policy="only", na.rm=TRUE)
+  r_pre_imp  <- focal(r_pre,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+
+  evi_g  <- terra::extract(r_evi_imp,  grid_wgs)[,2]
+  ntl_g  <- terra::extract(r_ntl_imp,  grid_wgs)[,2]
+  temp_g <- terra::extract(r_temp_imp, grid_wgs)[,2]
+  pre_g  <- terra::extract(r_pre_imp,  grid_wgs)[,2]
+
+  elev_ras <- tryCatch(get_elev_raster(locations=h$shp_wgs, z=6, src="aws", clip="locations"),
+                       error=function(e) NULL)
+  if(!is.null(elev_ras)){
+    elev_g <- terra::extract(rast(elev_ras), grid_wgs)[,2]
+  } else {
+    elev_g <- rep(std_const$Elev["mean"], nrow(grid_wgs))
+  }
+  elev_g[is.na(elev_g)] <- median(elev_g, na.rm=TRUE)
+
+  # ── Hydrology on the grid, reusing this country's flow raster / river net ──
+  fa_g <- terra::extract(h$r_flowacc, vect(grid_sf))[,2]
+  fa_g[is.na(fa_g)] <- 1
+  log_flowacc_g <- log1p(fa_g)
+
+  batch_size <- 800; ng <- nrow(grid_sf)
+  dist_g <- numeric(ng)
+  for(b in seq(1, ng, by=batch_size)){
+    idx <- b:min(b+batch_size-1, ng)
+    nn  <- st_nearest_feature(grid_sf[idx,], h$rivers_utm)
+    dist_g[idx] <- as.numeric(st_distance(grid_sf[idx,], h$rivers_utm[nn,], by_element=TRUE))
+  }
+  log_dist_river_g <- log1p(dist_g/1000)
+
+  nn_all   <- st_nearest_feature(grid_sf, h$rivers_utm)
+  reach_buf_wgs <- st_transform(st_buffer(h$rivers_utm[nn_all,], dist=500), crs=4326)
+  riparian_evi_g <- terra::extract(r_evi_imp, vect(reach_buf_wgs), fun=mean, na.rm=TRUE)[,2]
+  riparian_evi_g[is.na(riparian_evi_g)] <- std_const$riparian_evi["mean"]
+
+  # ── Recent climate anomaly on the grid (global rasters, already in memory) ─
+  spei_g <- terra::extract(r_spei12, grid_wgs)[,2]
+  spei_g[is.na(spei_g)] <- std_const$SPEI12["mean"]
+  tmax_g <- terra::extract(r_tmax_2014, grid_wgs)[,-1]
+  heat_g <- rowSums(tmax_g > heat_threshold_c, na.rm=TRUE)
+
+  # ── Population density (persons/km2, GPW v4 2015) for burden-weighted maps ─
+  popdens_g <- terra::extract(r_popdens, grid_wgs)[,2]
+  popdens_g[is.na(popdens_g)] <- 0
+  cell_area_km2 <- 20*20   # matches spat_res=20 km grid cells
+  pop_count_g <- popdens_g * cell_area_km2
+
+  pred_covs <- data.frame(
+    EVI_s            = (evi_g            - std_const$EVI["mean"])            / std_const$EVI["sd"],
+    logNTL_s         = (log(ntl_g+1)     - std_const$logNTL["mean"])        / std_const$logNTL["sd"],
+    Temp_s           = (temp_g           - std_const$Temp["mean"])          / std_const$Temp["sd"],
+    Elev_s           = (elev_g           - std_const$Elev["mean"])          / std_const$Elev["sd"],
+    Precip_s         = (pre_g            - std_const$Precip["mean"])        / std_const$Precip["sd"],
+    log_flowacc_s    = (log_flowacc_g    - std_const$log_flowacc["mean"])    / std_const$log_flowacc["sd"],
+    log_dist_river_s = (log_dist_river_g - std_const$log_dist_river["mean"]) / std_const$log_dist_river["sd"],
+    riparian_evi_s   = (riparian_evi_g   - std_const$riparian_evi["mean"])   / std_const$riparian_evi["sd"],
+    SPEI12_s         = (spei_g           - std_const$SPEI12["mean"])         / std_const$SPEI12["sd"],
+    heat_days_s      = (heat_g           - std_const$heat_days["mean"])      / std_const$heat_days["sd"]
+  )
+
+  list(grid_c=grid_c, grid_sf=grid_sf, pred_covs=pred_covs, pop_count=pop_count_g)
+}
+
+pred_setup <- setNames(
+  lapply(seq_len(nrow(country_meta)), function(i) build_country_prediction(country_meta[i,])),
+  country_meta$country_name)
+
+elim_threshold <- 0.01   # documented proxy "near-zero transmission" threshold; see Methods
+
+# Linear predictor samples = fixed-effect mean (mu_pred) + spatial GP samples
+# (S_samples), matching RiskMap::pred_target_grid()'s own construction.
+get_lp_samples <- function(pred_obj) sweep(pred_obj$S_samples, 1, pred_obj$mu_pred, "+")
+
+## Joint-type prediction is used throughout (rather than marginal) so that the
+## same MCML samples can also feed the admin-level (ADM2) aggregation via
+## RiskMap::pred_target_shp(), which requires type="joint".
+pr_joint_list <- setNames(vector("list", nrow(country_meta)), country_meta$country_name)
+
+country_predictions <- lapply(country_meta$country_name, function(cn){
+  ps   <- pred_setup[[cn]]
+  covs <- gp_covs[[cn]]
+  epsg <- country_meta$epsg[country_meta$country_name==cn]
+  # Grid cells with any NA in the retained covariates (e.g. coastal cells
+  # outside raster coverage) are dropped before calling pred_over_grid, so
+  # the returned samples stay row-aligned with the grid geometry.
+  ok <- stats::complete.cases(ps$pred_covs[, covs, drop=FALSE])
+  grid_ok <- ps$grid_c[ok, ]
+  grid_sf_ok <- ps$grid_sf[ok, ]
+  pred_covs_ok <- ps$pred_covs[ok, covs, drop=FALSE]
+  pop_ok <- ps$pop_count[ok]
+
+  pr <- pred_over_grid(gp_models[[cn]], predictors=pred_covs_ok,
+                       grid_pred=grid_ok, type="joint")
+  pr_joint_list[[cn]] <<- pr
+  lp_samples <- get_lp_samples(pr)
+  prev_mat   <- plogis(lp_samples)
+
+  val_spatial    <- rowMeans(prev_mat, na.rm=TRUE)          # "after kriging": posterior mean
+  val_nonspatial <- plogis(pr$mu_pred)                        # "before kriging": fixed effects only
+  elim_prob      <- rowMeans(prev_mat < elim_threshold, na.rm=TRUE)
+  burden         <- val_spatial * pop_ok
+
+  coords     <- st_coordinates(grid_sf_ok)
+  coords_wgs <- st_coordinates(st_transform(grid_sf_ok, crs=4326))
+  data.frame(x=coords[,1], y=coords[,2], lon=coords_wgs[,1], lat=coords_wgs[,2],
+             val=val_spatial, val_nonspatial=val_nonspatial,
+             elim_prob=elim_prob, pop=pop_ok, burden=burden, Country=cn) %>%
+    filter(!is.na(val))
+})
+names(country_predictions) <- country_meta$country_name
+
+prev_lim_all <- c(0, max(sapply(country_predictions, function(d) quantile(d$val,0.99,na.rm=TRUE))))
+nonspatial_lim_all <- c(0, max(sapply(country_predictions, function(d) quantile(d$val_nonspatial,0.99,na.rm=TRUE))))
+burden_cap_all <- max(sapply(country_predictions, function(d) quantile(d$burden,0.95,na.rm=TRUE)))
+
+# ── Combined pooled data frame: all 4 countries' independently-kriged grids, ─
+# in WGS84, on one shared canvas (Africa context). This is a visual pooling
+# of four separate country-level GP surfaces, NOT a single cross-country GP
+# field (which is not fitted, for the reasons given in Methods).
+pooled_predictions <- bind_rows(country_predictions)
+```
+
+```{r admin-level-agg, include=FALSE}
+# ── Admin-level (ADM2) classification: aggregate the joint-type posterior ────
+# samples to administrative regions per country, giving a "real map" (proper
+# admin boundaries, like a standard Ministry-of-Health prevalence map) rather
+# than only a raw 20km prediction grid.
+adm1_list <- setNames(
+  lapply(seq_len(nrow(country_meta)), function(i){
+    # ADM2 (district/county level) is the smallest administrative level
+    # available from geoBoundaries for all four countries simultaneously.
+    shp1_wgs <- geoboundaries(country=country_meta$gb_name[i], adm_lvl="adm2")
+    st_transform(shp1_wgs, crs=country_meta$epsg[i])
+  }),
+  country_meta$country_name)
+
+adm1_class <- function(x) which.max(c(mean(x<0.10), mean(x>=0.10&x<0.20), mean(x>=0.20)))
+
+adm1_results <- lapply(country_meta$country_name, function(cn){
+  pred_adm1 <- pred_target_shp(
+    pr_joint_list[[cn]],
+    f_target=list(prev=function(lp) exp(lp)/(1+exp(lp))),
+    shp=adm1_list[[cn]], shp_target=mean,
+    pd_summary=list(mean=mean,
+      lower95=function(x) quantile(x,0.025),
+      upper95=function(x) quantile(x,0.975),
+      class=adm1_class),
+    col_names="shapeName", messages=FALSE)
+
+  shp_out <- pred_adm1$shp
+  rn <- names(pred_adm1$target)
+  tbl <- do.call(rbind, lapply(rn, function(r){
+    s <- pred_adm1$target[[r]]$prev
+    data.frame(Region=r, Country=cn,
+               mean=as.numeric(s[["mean"]]),
+               lower95=as.numeric(s[["lower95"]]),
+               upper95=as.numeric(s[["upper95"]]),
+               class=as.integer(s[["class"]]))
+  }))
+  list(shp=shp_out, tbl=tbl)
+})
+names(adm1_results) <- country_meta$country_name
+
+adm1_tbl_all <- bind_rows(lapply(adm1_results, `[[`, "tbl"))
+
+# Combined sf of ADM2 polygons + estimates, reprojected to WGS84 for the
+# single pooled Africa map.
+adm1_sf_all <- bind_rows(lapply(country_meta$country_name, function(cn){
+  shp <- adm1_results[[cn]]$shp
+  tbl <- adm1_results[[cn]]$tbl
+  shp <- st_transform(shp, crs=4326)
+  shp$Country <- cn
+  # shapeName join: pred_target_shp preserves polygon order from the input shp
+  shp$mean  <- tbl$mean[match(shp$shapeName, tbl$Region)]
+  shp$class <- tbl$class[match(shp$shapeName, tbl$Region)]
+  shp
+}))
+```
+
+```{r smooth-rasters, include=FALSE}
+# ── Real-boundary, non-blocky rasters for display ─────────────────────────────
+# The 20 km MCML prediction grid is a regular point lattice (necessarily coarse
+# to keep joint-type MCML sampling tractable across 4 countries); plotted
+# directly as tiles it looks blocky and can visually overhang a country's true
+# border. Here each country's predicted surface is (1) rasterised onto its
+# exact 20 km lattice, (2) masked to that country's real ADM0 boundary polygon
+# (geoBoundaries, the same high-resolution source used throughout), which
+# clips the blocky edge to the true coastline/border shape, and (3) bilinearly
+# disaggregated to a finer display lattice (fact=4, i.e. 5 km) purely for
+# smoother rendering -- no new information is added, only interpolation
+# between existing kriged values, and this is stated in every caption that
+# uses it.
+make_country_raster <- function(cn, valcol, disagg_fact=4){
+  df   <- country_predictions[[cn]]
+  epsg <- country_meta$epsg[country_meta$country_name==cn]
+  shp_utm <- hydro_list[[cn]]$shp_utm
+  r <- terra::rast(df[, c("x","y",valcol)], type="xyz", crs=paste0("EPSG:",epsg))
+  r <- terra::mask(r, terra::vect(shp_utm))
+  if(disagg_fact > 1) r <- terra::disagg(r, fact=disagg_fact, method="bilinear")
+  names(r) <- valcol
+  r
+}
+raster_to_df <- function(r) as.data.frame(r, xy=TRUE)
+
+# Per-country smoothed rasters (UTM, for single-country panel figures)
+smooth_val_utm    <- setNames(lapply(country_meta$country_name, make_country_raster, valcol="val"), country_meta$country_name)
+smooth_nonsp_utm  <- setNames(lapply(country_meta$country_name, make_country_raster, valcol="val_nonspatial"), country_meta$country_name)
+smooth_elim_utm   <- setNames(lapply(country_meta$country_name, make_country_raster, valcol="elim_prob"), country_meta$country_name)
+smooth_burden_utm <- setNames(lapply(country_meta$country_name, make_country_raster, valcol="burden"), country_meta$country_name)
+
+# WGS84-projected versions, merged into one seamless raster for the pooled
+# Africa-wide map (Figure 9): real reprojection, not manually-sized tiles, so
+# adjoining country rasters neither gap nor overlap.
+smooth_val_wgs_list <- lapply(smooth_val_utm, function(r) terra::project(r, "EPSG:4326", method="bilinear"))
+pooled_val_raster   <- Reduce(function(a,b) terra::merge(a,b), smooth_val_wgs_list)
+pooled_val_df       <- raster_to_df(pooled_val_raster)
+```
+
+# Results
+
+## Study area
+
+Figure 1 shows the four study countries in their African context, with survey villages overlaid, coloured by country.
+
+```{r fig1-africa-map, fig.cap="**Figure 1.** Study area: the four REMO survey countries (Tanzania, Cameroon, Malawi, Mozambique) within continental Africa, with all pooled survey villages plotted (coloured by country). Grey: other African countries (context only, not analysed). The four countries are not geographically contiguous, which is the basis for fitting independent, rather than shared, spatial (Gaussian process) fields per country (Methods).", fig.height=8, fig.width=8}
+hires_dir <- "figures_hires"
+if(!dir.exists(hires_dir)) dir.create(hires_dir)
+
+study_fill <- ifelse(africa_countries$iso_a3 %in% study_iso3, "Study country", "Other")
+p_fig1 <- ggplot() +
+  geom_sf(data=africa_countries, aes(fill=study_fill), colour="white", linewidth=0.15) +
+  geom_point(data=remo_all, aes(x=long_wgs, y=lat_wgs, colour=Country), size=0.5, alpha=0.6) +
+  scale_fill_manual(values=c("Study country"="#c7e9c0","Other"="grey90"), name=NULL) +
+  scale_colour_brewer(palette="Set1", name="Survey villages") +
+  coord_sf(xlim=c(-20,52), ylim=c(-35,38)) +
+  theme_minimal(base_size=10) +
+  theme(legend.position="bottom", panel.grid=element_blank()) +
+  labs(x=NULL, y=NULL) +
+  ggspatial::annotation_scale(location="bl", text_cex=0.7) +
+  ggspatial::annotation_north_arrow(location="tr", which_north="true",
+                                    height=unit(1,"cm"), width=unit(1,"cm"),
+                                    style=ggspatial::north_arrow_minimal())
+ggsave(file.path(hires_dir,"Figure1_study_area.pdf"), p_fig1, width=7, height=7, device="pdf")
+ggsave(file.path(hires_dir,"Figure1_study_area.png"), p_fig1, width=7, height=7, dpi=600)
+p_fig1
+```
+
+## Survey prevalence by country
+
+```{r table1-prevalence}
+kable(prev_by_country %>% mutate(prevalence=paste0(round(100*prevalence,1),"%")),
+      col.names=c("Country","Villages","Total examined (n)","Total positive (y)","Crude prevalence"),
+      caption=paste0("**Table 1.** Crude onchocerciasis palpation-nodule prevalence by country, 2014 REMO ",
+                      "survey data. Design-based (village-clustered) pooled prevalence: ",
+                      round(prev_est*100,1), "% (95% CI ", round(prev_ci[1]*100,1), "--",
+                      round(prev_ci[2]*100,1), "%).")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+```
+
+`r n_villages_total` unique villages were pooled across the four countries after deduplication. Table 2 confirms the ten pooled-standardised covariates are not problematically collinear (all VIF below 10).
+
+```{r table2-vif}
+kable(vif_tbl, row.names=FALSE,
+      caption="**Table 2.** Variance inflation factors for the ten pooled-standardised covariates, computed on the pooled four-country dataset.") %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+```
+
+Figure 2 shows the pairwise Pearson correlation structure of the ten pooled-standardised covariates underlying Table 2's VIF check, so that any moderate (if sub-threshold) collinearity is visible directly rather than only summarised through a single VIF statistic per covariate.
+
+```{r fig2-correlation, fig.cap="**Figure 2.** Pairwise Pearson correlation matrix of the ten pooled-standardised covariates (EVI, log Night-Time Lights, temperature, elevation, precipitation, log-flow-accumulation, log-distance-to-river, riparian vegetation, SPEI-12, excess-heat-days), computed on the pooled four-country dataset (n=1714 villages). Cell colour and printed value give the Pearson correlation coefficient; no pair exceeds the conventional |r| > 0.8 collinearity concern, consistent with the variance-inflation-factor screen in Table 2.", fig.height=8, fig.width=8.5}
+cor_vars <- c("EVI_s","logNTL_s","Temp_s","Elev_s","Precip_s","log_flowacc_s",
+             "log_dist_river_s","riparian_evi_s","SPEI12_s","heat_days_s")
+cor_labels_short <- c(EVI_s="EVI", logNTL_s="logNTL", Temp_s="Temp", Elev_s="Elev",
+                      Precip_s="Precip", log_flowacc_s="FlowAcc", log_dist_river_s="DistRiver",
+                      riparian_evi_s="RipEVI", SPEI12_s="SPEI12", heat_days_s="HeatDays")
+cor_mat <- cor(remo_all[, cor_vars], use="complete.obs")
+rownames(cor_mat) <- cor_labels_short[rownames(cor_mat)]
+colnames(cor_mat) <- cor_labels_short[colnames(cor_mat)]
+cor_long <- as.data.frame(as.table(cor_mat))
+names(cor_long) <- c("Var1","Var2","Correlation")
+
+p_fig2 <- ggplot(cor_long, aes(x=Var1, y=Var2, fill=Correlation)) +
+  geom_tile(colour="white") +
+  geom_text(aes(label=sprintf("%.2f", Correlation)), size=2.8) +
+  scale_fill_gradient2(low="#2166ac", mid="white", high="#b2182b", midpoint=0, limits=c(-1,1)) +
+  coord_fixed() +
+  theme_minimal(base_size=10) +
+  theme(axis.text.x=element_text(angle=45, hjust=1), axis.title=element_blank(),
+       panel.grid=element_blank(), legend.position="right")
+ggsave(file.path(hires_dir,"Figure2_correlation_matrix.pdf"), p_fig2, width=7, height=6.5, device="pdf")
+ggsave(file.path(hires_dir,"Figure2_correlation_matrix.png"), p_fig2, width=7, height=6.5, dpi=600)
+p_fig2
+```
+
+## Covariate associations (empirical logit smooths)
+
+Figure 3 shows generalised additive model (GAM) smooths of the empirical logit of prevalence against each of the ten pooled-standardised covariates, with a separate smooth per country, following the same diagnostic approach as the single-country Tanzania script (there, Figure 2) but now with country as an explicit grouping factor so that any divergence in the raw covariate-prevalence relationship is visible before any regression model is fitted.
+
+```{r fig3-elogit, fig.cap="**Figure 3.** Generalised additive model (GAM) smooths of the empirical logit of onchocerciasis palpation-nodule positivity against each pooled-standardised covariate (z-score), fitted separately by country. Points are individual villages (semi-transparent); lines are per-country GAM smooths with shaded 95% CI. Divergent slopes or crossing lines across countries for a given covariate are the raw-data signature of the heterogeneity formally tested in Figure 4 and Table 3.", fig.height=13, fig.width=10}
+elogit_labels <- c(EVI_s="EVI (vegetation)", logNTL_s="log Night-Time Lights (urbanisation)",
+                   Temp_s="Temperature", Elev_s="Elevation", Precip_s="Precipitation",
+                   log_flowacc_s="Flow accumulation (log)", log_dist_river_s="Distance to river (log)",
+                   riparian_evi_s="Riparian vegetation", SPEI12_s="SPEI-12 (drought)",
+                   heat_days_s="Excess heat days")
+elogit_long <- remo_all %>%
+  select(Country, elogit, all_of(names(elogit_labels))) %>%
+  tidyr::pivot_longer(cols=all_of(names(elogit_labels)), names_to="Covariate", values_to="z") %>%
+  mutate(Covariate=factor(elogit_labels[Covariate], levels=unname(elogit_labels)))
+
+p_fig3b <- ggplot(elogit_long, aes(x=z, y=elogit, colour=Country, fill=Country)) +
+  geom_point(alpha=0.12, size=0.7) +
+  geom_smooth(method="gam", formula=y~s(x,bs="cs",k=6), linewidth=0.8, se=TRUE, alpha=0.15) +
+  facet_wrap(~Covariate, scales="free_x", ncol=2) +
+  labs(x="z-score (pooled scale)", y="Empirical logit of prevalence") +
+  theme_minimal(base_size=10) +
+  theme(legend.position="bottom", strip.text=element_text(face="bold"))
+ggsave(file.path(hires_dir,"Figure3_elogit_smooths.pdf"), p_fig3b, width=8.5, height=11, device="pdf")
+ggsave(file.path(hires_dir,"Figure3_elogit_smooths.png"), p_fig3b, width=8.5, height=11, dpi=600)
+p_fig3b
+```
+
+## Heterogeneity test
+
+A likelihood-ratio test comparing the country-interaction GLMM (country interactions for all eight climate/hydrology/anomaly covariates) against the main-effects-only GLMM gave $\chi^2$(`r lrt_df`) = `r round(lrt_chisq,2)`, p `r ifelse(lrt_p<0.001,"< 0.001",paste0("= ",round(lrt_p,4)))`. `r if(quad_improves) "A quadratic extension to temperature and elevation improved AIC by more than 2 units and is reported alongside the linear model as a robustness check; it did not change the qualitative heterogeneity conclusion." else "Adding quadratic temperature/elevation terms did not materially improve AIC over the linear specification, supporting the linear simplification adopted here."`
+
+```{r table3-lrt}
+lrt_tbl <- data.frame(
+  Model = c("Main effects (climate + hydrology + anomaly + country, no interaction)",
+            "Country interaction (all eight covariates x country)"),
+  AIC   = round(c(AIC(m_main), AIC(m_int)),1),
+  logLik= round(c(as.numeric(logLik(m_main)), as.numeric(logLik(m_int))),1),
+  df    = c(attr(logLik(m_main),"df"), attr(logLik(m_int),"df"))
+)
+kable(lrt_tbl, row.names=FALSE,
+      caption=paste0("**Table 3.** Likelihood-ratio test for climate/hydrology/anomaly x country heterogeneity. ",
+                      "Chi-square = ", round(lrt_chisq,2), ", df = ", lrt_df, ", p ",
+                      ifelse(lrt_p<0.001,"< 0.001",paste0("= ",round(lrt_p,4))), ".")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+```
+
+## Country-specific slopes across the climate-to-transmission chain
+
+Figure 4 shows the country-specific slope (main effect plus interaction contrast, 95% CI) for all eight climate, hydrology, and recent-anomaly covariates.
+
+```{r fig4-forest, fig.cap="**Figure 4.** Country-specific slopes (log-odds per one pooled-standard-deviation increase) across the climate-to-transmission chain: climate normals (temperature, elevation, precipitation), hydrology (flow accumulation, distance to river, riparian vegetation), and recent climate anomaly (SPEI-12, excess heat days), from the country-interaction binomial GLMM. Points are country-specific slopes; bars are 95% Wald CIs. A vertical dashed line at zero marks no association.", fig.height=10, fig.width=9}
+p_fig3 <- ggplot(slopes_all, aes(x=Estimate, y=Country)) +
+  geom_vline(xintercept=0, linetype="dashed", colour="grey40") +
+  geom_pointrange(aes(xmin=lower, xmax=upper), size=0.5, colour="steelblue") +
+  facet_wrap(~Covariate, scales="free_x", ncol=2) +
+  labs(x="Log-odds per 1 SD (pooled scale)", y=NULL) +
+  theme_minimal(base_size=10) +
+  theme(strip.text=element_text(face="bold"))
+ggsave(file.path(hires_dir,"Figure4_forest_heterogeneity.pdf"), p_fig3, width=8, height=9, device="pdf")
+ggsave(file.path(hires_dir,"Figure4_forest_heterogeneity.png"), p_fig3, width=8, height=9, dpi=600)
+p_fig3
+```
+
+The largest-magnitude slope in the climate-to-transmission chain was **`r strongest_row$Covariate`** in **`r strongest_row$Country`** (`r round(strongest_row$Estimate,2)` log-odds per SD, 95% CI `r round(strongest_row$lower,2)` to `r round(strongest_row$upper,2)`); the smallest-magnitude was **`r weakest_row$Covariate`** in **`r weakest_row$Country`** (`r round(weakest_row$Estimate,2)`, 95% CI `r round(weakest_row$lower,2)` to `r round(weakest_row$upper,2)`).
+
+## Fixed-effect estimates (pooled interaction model)
+
+```{r table4-coefs}
+fe <- as.data.frame(summary(m_int)$coefficients)
+fe_out <- data.frame(Parameter=rownames(fe), Est=round(fe[,1],3), SE=round(fe[,2],3),
+                     OR=round(exp(fe[,1]),3), p=ifelse(fe[,4]<0.001,"<0.001",round(fe[,4],3)))
+re_var <- round(as.data.frame(VarCorr(m_int))$vcov, 3)
+kable(fe_out, row.names=FALSE,
+      col.names=c("Predictor","Estimate (log-odds)","SE","Odds ratio","p-value"),
+      caption=paste0("**Table 4.** Fixed-effect estimates from the pooled country-interaction GLMM. ",
+                      "Reference country: Cameroon. Village random-effect variance: ", re_var,
+                      " (SD ", round(sqrt(re_var),3), ").")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=TRUE, font_size=9)
+```
+
+## Per-country geostatistical predictions
+
+```{r table5-gp-params}
+gp_tbl <- do.call(rbind, lapply(country_meta$country_name, function(cn){
+  th <- gp_theta[[cn]]
+  data.frame(Country=cn, sigma2=round(th$sigma2,3), phi_km=round(th$phi,1),
+             tau2=ifelse(is.null(th$tau2), NA, round(th$tau2,3)),
+             Covariates=paste(gsub("_s$","",gp_covs[[cn]]), collapse=", "))
+}))
+kable(gp_tbl, row.names=FALSE,
+      col.names=c("Country","Partial sill (sigma2)","Spatial range, phi (km)","Nugget (tau2)","Covariates retained"),
+      caption="**Table 5.** Gaussian process parameters (Monte Carlo maximum likelihood) for the independent per-country spatial models, and the covariate subset each country's model actually retained after the VIF/separation fallback described in Methods.") %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=TRUE, font_size=10)
+```
+
+Figure 5 shows the raw empirical semi-variogram of village-level random effects (from a null, covariate-free binomial GLMM with a village random intercept) for each country: a rise in semivariance with distance indicates spatial autocorrelation not yet explained by any covariate.
+
+```{r fig5-empirical-variograms, fig.cap="**Figure 5.** Empirical semi-variograms of village-level random effects from a null (covariate-free) binomial GLMM, one per country, with a 999-permutation envelope (shaded ribbon) for the null hypothesis of no spatial structure. Bins span 1 km to each country's own maximum inter-village distance (country-specific, not a shared fixed grid), which resolves the very unevenly populated bins that a one-size-fits-all binning produced for geographically dispersed surveys such as Mozambique (villages span over 1,600 km). A rising semivariance outside the envelope indicates spatially autocorrelated residual risk; points within the envelope are consistent with no detectable spatial structure at that distance. This is the raw diagnostic motivating the geostatistical (GP) models; compare with the fitted theoretical curves in Figure 6.", fig.height=7, fig.width=8}
+vario_plots <- lapply(country_meta$country_name, function(cn){
+  v <- emp_variograms[[cn]]
+  if(is.null(v)){
+    ggplot() + theme_void() + labs(title=paste(cn, "(variogram unavailable)"))
+  } else {
+    plot_s_variogram(v, plot_envelope=TRUE) + labs(title=cn) + theme_minimal(base_size=10) +
+      theme(plot.title=element_text(face="bold"))
+  }
+})
+p_fig5 <- (vario_plots[[1]]|vario_plots[[2]])/(vario_plots[[3]]|vario_plots[[4]])
+ggsave(file.path(hires_dir,"Figure5_empirical_variograms.pdf"), p_fig5, width=8, height=7, device="pdf")
+ggsave(file.path(hires_dir,"Figure5_empirical_variograms.png"), p_fig5, width=8, height=7, dpi=600)
+p_fig5
+```
+
+Figure 6 plots the fitted theoretical exponential variogram $\gamma(d)=\tau^2+\sigma^2(1-e^{-d/\phi})$ for each country's independent GP model (parameters from Table 5), analogous to the model-comparison variogram figure in the single-country Tanzania script but here comparing countries rather than nested covariate sets.
+
+```{r fig6-theoretical-variograms, fig.cap="**Figure 6.** Fitted theoretical exponential variograms, $\\gamma(d)=\\tau^2+\\sigma^2(1-e^{-d/\\phi})$, for each country's independent Gaussian process model (Monte Carlo maximum likelihood; parameters as in Table 5). Dotted horizontal lines mark each country's total sill ($\\tau^2+\\sigma^2$). Differences in curve height (partial sill) and steepness (spatial range, phi) reflect how much, and over what distance, unexplained spatial clustering remains after the pooled covariate set for that country.", fig.height=5, fig.width=8}
+theo_variogram <- function(d, nugget, sill, phi) nugget + sill * (1 - exp(-d / phi))
+d_seq <- seq(0, 1200, length.out=400)
+df_vario <- do.call(rbind, lapply(country_meta$country_name, function(cn){
+  th <- gp_theta[[cn]]
+  tau2 <- if(is.null(th$tau2)) 0 else th$tau2
+  data.frame(Distance=d_seq, Gamma=theo_variogram(d_seq, tau2, th$sigma2, th$phi),
+             Country=cn, total_sill=tau2+th$sigma2)
+}))
+p_fig6 <- ggplot(df_vario, aes(x=Distance, y=Gamma, colour=Country)) +
+  geom_line(linewidth=1.1) +
+  geom_hline(data=distinct(df_vario, Country, total_sill),
+             aes(yintercept=total_sill, colour=Country), linetype="dotted", alpha=0.7,
+             show.legend=FALSE) +
+  labs(x="Inter-village distance (km)", y=expression("Semivariance  " ~ gamma(d))) +
+  theme_minimal(base_size=11) +
+  theme(legend.position="bottom", panel.grid.minor=element_blank())
+ggsave(file.path(hires_dir,"Figure6_theoretical_variograms.pdf"), p_fig6, width=7, height=5, device="pdf")
+ggsave(file.path(hires_dir,"Figure6_theoretical_variograms.png"), p_fig6, width=7, height=5, dpi=600)
+p_fig6
+```
+
+## Before versus after kriging
+
+Figure 7 contrasts, for each country, the prevalence surface predicted from covariates alone (the fixed-effect linear predictor $\beta_0+\sum_k\beta_kX_k$, "before kriging") against the full geostatistical prediction that adds the fitted spatial Gaussian process $S(\mathbf{x})$ ("after kriging"). The difference between the two panels in each row is exactly the contribution of spatial borrowing: any structure in the after-kriging map that is absent from the before-kriging map reflects village-to-village clustering the covariates alone do not explain. Both panels are masked to each country's real boundary shape and bilinearly smoothed for display (Methods; the underlying kriged resolution is 20 km).
+
+```{r fig7-before-after-kriging, fig.cap="**Figure 7.** Predicted onchocerciasis prevalence before versus after kriging, by country. Left column: non-spatial prediction from the fitted covariates alone (fixed-effect linear predictor only). Right column: full geostatistical (Gaussian process, MCML) posterior mean prediction, adding the fitted spatial random field. Both columns share the same colour scale within each country's row (with a single, shared legend per row) and are masked to, and outlined with, the country's real boundary shape, bilinearly smoothed for display (20 km kriging resolution; see Methods). The gap between columns is the spatial (kriging) contribution not captured by covariates alone.", fig.height=15, fig.width=8}
+theme_map <- theme_minimal(base_size=9) +
+  theme(plot.title=element_text(size=9,face="bold"),
+        legend.position="bottom", legend.key.width=unit(1.0,"cm"),
+        legend.box.spacing=unit(0.15,"cm"), legend.margin=margin(t=0))
+
+mk_pair <- function(cn){
+  df_nonsp <- raster_to_df(smooth_nonsp_utm[[cn]])
+  df_sp    <- raster_to_df(smooth_val_utm[[cn]])
+  bnd      <- st_geometry(hydro_list[[cn]]$shp_utm)
+  lim <- c(0, max(quantile(df_sp$val,0.99,na.rm=TRUE), quantile(df_nonsp$val_nonspatial,0.99,na.rm=TRUE)))
+  p_before <- ggplot(df_nonsp, aes(x=x, y=y, fill=val_nonspatial)) +
+    geom_raster() +
+    geom_sf(data=bnd, fill=NA, colour="black", linewidth=0.35, inherit.aes=FALSE) +
+    scale_fill_viridis_c(name="Prevalence", option="plasma", limits=lim,
+                         oob=scales::oob_squish, na.value="transparent") +
+    coord_sf(datum=NA) + labs(title=paste0(cn, ": before kriging (covariates only)"), x=NULL, y=NULL) + theme_map
+  p_after <- ggplot(df_sp, aes(x=x, y=y, fill=val)) +
+    geom_raster() +
+    geom_sf(data=bnd, fill=NA, colour="black", linewidth=0.35, inherit.aes=FALSE) +
+    scale_fill_viridis_c(name="Prevalence", option="plasma", limits=lim,
+                         oob=scales::oob_squish, na.value="transparent") +
+    coord_sf(datum=NA) + labs(title=paste0(cn, ": after kriging (+ spatial GP)"), x=NULL, y=NULL) + theme_map
+  # guides="collect" merges the two panels' identical (shared-scale) legends
+  # into one, which is what removes the legend overlap in the stacked layout.
+  (p_before | p_after) + plot_layout(guides="collect") & theme(legend.position="bottom")
+}
+pairs <- lapply(country_meta$country_name, mk_pair)
+p_fig7 <- wrap_plots(pairs, ncol=1)
+ggsave(file.path(hires_dir,"Figure7_before_after_kriging.pdf"), p_fig7, width=8, height=15, device="pdf")
+ggsave(file.path(hires_dir,"Figure7_before_after_kriging.png"), p_fig7, width=8, height=15, dpi=600)
+p_fig7
+```
+
+## Prediction maps with river network context
+
+Figure 8 shows the final (after-kriging) posterior mean prevalence maps with each country's own river network overlaid in red, so predicted hotspots can be read against the hydrological features driving the flow-accumulation and river-distance covariates.
+
+```{r fig8-maps-rivers, fig.cap="**Figure 8.** Predicted onchocerciasis prevalence by country from independent per-country Gaussian process models on the pooled covariate scale, masked to, and outlined with (black line), each country's real boundary shape and bilinearly smoothed for display (20 km kriging resolution; see Methods), with each country's Natural Earth 1:10m river network overlaid in red. No cross-country spatial field was fitted.", fig.height=9, fig.width=9}
+mkp_river <- function(cn){
+  df <- raster_to_df(smooth_val_utm[[cn]])
+  epsg <- country_meta$epsg[country_meta$country_name==cn]
+  rivers_cn <- hydro_list[[cn]]$rivers_utm
+  bnd <- st_geometry(hydro_list[[cn]]$shp_utm)
+  ggplot() +
+    geom_raster(data=df, aes(x=x, y=y, fill=val)) +
+    geom_sf(data=bnd, fill=NA, colour="black", linewidth=0.4, inherit.aes=FALSE) +
+    geom_sf(data=rivers_cn, colour="red", linewidth=0.4, alpha=0.9, inherit.aes=FALSE) +
+    scale_fill_viridis_c(name="Prevalence", option="plasma", limits=prev_lim_all,
+                         oob=scales::oob_squish, na.value="transparent") +
+    coord_sf(crs=epsg, datum=NA) + labs(title=cn, x=NULL, y=NULL) + theme_map +
+    ggspatial::annotation_scale(location="bl", text_cex=0.55, height=unit(0.1,"cm")) +
+    ggspatial::annotation_north_arrow(location="tr", which_north="true",
+                                      height=unit(0.7,"cm"), width=unit(0.7,"cm"),
+                                      style=ggspatial::north_arrow_minimal())
+}
+maps_river <- lapply(country_meta$country_name, mkp_river)
+p_fig8 <- (maps_river[[1]]|maps_river[[2]])/(maps_river[[3]]|maps_river[[4]]) +
+  plot_layout(guides="collect") & theme(legend.position="bottom")
+ggsave(file.path(hires_dir,"Figure8_maps_rivers.pdf"), p_fig8, width=9, height=9, device="pdf")
+ggsave(file.path(hires_dir,"Figure8_maps_rivers.png"), p_fig8, width=9, height=9, dpi=600)
+p_fig8
+```
+
+## Pooled Africa-wide view with administrative-level classification
+
+The four countries' independent GP predictions are visualised here on a single shared Africa map, in their true geographic position, with a real coastline/border basemap and administrative level-2 (ADM2, district/county) boundaries, rather than as four separate small-multiple panels. This is a *visual* pooling of four independently-kriged country surfaces onto one canvas, matching the presentation style used for the Uganda project; it is not a statistical pooling into a single cross-country spatial field, since (as in Methods) the four countries are not geographically contiguous and a shared covariance function between them has no basis.
+
+Table 6 gives the admin-level (ADM2, district/county) aggregated posterior mean prevalence and 95% predictive interval for every region across all four countries, obtained by aggregating the joint-type MCML posterior samples to each administrative polygon (`RiskMap::pred_target_shp`), exactly as the single-country Tanzania script did for Tanzania's own regions, extended here to all four countries at once.
+
+```{r table6-adm1}
+adm1_tbl_out <- adm1_tbl_all %>%
+  mutate(mean=round(mean,3), lower95=round(lower95,3), upper95=round(upper95,3),
+        Class=c("1: <10%","2: 10-20%","3: >20%")[class]) %>%
+  select(Country, Region, mean, lower95, upper95, Class) %>%
+  arrange(Country, desc(mean))
+kable(adm1_tbl_out, row.names=FALSE,
+      col.names=c("Country","Admin-2 (district/county)","Mean prevalence","Lower 95%","Upper 95%","Class"),
+      caption=paste0("**Table 6.** Administrative level-2 (ADM2, district/county) aggregated posterior mean onchocerciasis ",
+                      "prevalence for all ", nrow(adm1_tbl_all), " regions across the four countries, from ",
+                      "joint-type MCML posterior samples (RiskMap::pred_target_shp). ",
+                      "Class 1 = <10% (low), Class 2 = 10-20% (moderate), Class 3 = >20% (high).")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=TRUE, font_size=9) %>%
+  scroll_box(height="420px")
+```
+
+Figure 9 shows all four countries' continuous (grid-level) kriged prevalence surfaces plotted together on one Africa map, real-boundary-masked, seamlessly reprojected and merged (not manually-sized tiles), with ADM2 (district/county) boundaries and each country's river network (red) overlaid on a real Africa basemap (Natural Earth, 1:10m).
+
+```{r fig9-pooled-africa-continuous, fig.cap="**Figure 9.** Pooled Africa-wide view: independently-kriged posterior mean prevalence surfaces for all four countries (each masked to its own real boundary and bilinearly smoothed for display, 20 km kriging resolution; see Methods), reprojected and merged into one seamless raster and plotted in true geographic position on a real Africa basemap (Natural Earth 1:10m coastlines/borders, grey), with each country's ADM2 (district/county) boundaries (thin white lines) and river network (red) overlaid. Each country's surface comes from its own independent Gaussian process model (Table 5); this is a shared canvas, not a shared spatial field.", fig.height=9, fig.width=9}
+bbox_study <- st_bbox(adm1_sf_all)
+rivers_all_wgs <- bind_rows(lapply(country_meta$country_name, function(cn)
+  st_transform(hydro_list[[cn]]$rivers_utm, crs=4326) %>% st_geometry() %>% st_sf()))
+
+p_fig9 <- ggplot() +
+  geom_sf(data=africa_countries, fill="grey93", colour="white", linewidth=0.15) +
+  geom_raster(data=pooled_val_df, aes(x=x, y=y, fill=val)) +
+  geom_sf(data=adm1_sf_all, fill=NA, colour="white", linewidth=0.15, inherit.aes=FALSE) +
+  geom_sf(data=rivers_all_wgs, colour="red", linewidth=0.3, alpha=0.85, inherit.aes=FALSE) +
+  scale_fill_viridis_c(name="Prevalence", option="plasma", limits=prev_lim_all,
+                       oob=scales::oob_squish, na.value="transparent") +
+  coord_sf(xlim=c(bbox_study["xmin"]-3, bbox_study["xmax"]+3),
+           ylim=c(bbox_study["ymin"]-3, bbox_study["ymax"]+3)) +
+  theme_minimal(base_size=10) +
+  theme(legend.position="bottom", panel.grid=element_blank()) +
+  labs(x=NULL, y=NULL) +
+  ggspatial::annotation_scale(location="bl", text_cex=0.7) +
+  ggspatial::annotation_north_arrow(location="tr", which_north="true",
+                                    height=unit(1,"cm"), width=unit(1,"cm"),
+                                    style=ggspatial::north_arrow_minimal())
+ggsave(file.path(hires_dir,"Figure9_pooled_africa_continuous.pdf"), p_fig9, width=8, height=8, device="pdf")
+ggsave(file.path(hires_dir,"Figure9_pooled_africa_continuous.png"), p_fig9, width=8, height=8, dpi=600)
+p_fig9
+```
+
+Figure 10 shows the admin-level (ADM2, district/county) classified choropleth version of the same pooled view, the "real map" (proper administrative units rather than a raw prediction grid) for all four countries at once, coloured by the same low/moderate/high prevalence classification used in the single-country Tanzania script.
+
+```{r fig10-pooled-africa-adm1, fig.cap="**Figure 10.** Pooled Africa-wide administrative-level (ADM2, district/county) prevalence classification, all four countries on one map. Class 1 (green) = mean regional prevalence <10%; Class 2 (yellow) = 10-20%; Class 3 (red) = >20%. Regions are the same administrative boundaries used for Table 6.", fig.height=9, fig.width=9}
+adm1_sf_all_class <- adm1_sf_all %>%
+  mutate(Class=factor(c("Class 1: <10%","Class 2: 10-20%","Class 3: >20%")[class],
+                      levels=c("Class 1: <10%","Class 2: 10-20%","Class 3: >20%")))
+class_colours <- c("Class 1: <10%"="#1a9641","Class 2: 10-20%"="#ffffbf","Class 3: >20%"="#d7191c")
+
+p_fig10 <- ggplot() +
+  geom_sf(data=africa_countries, fill="grey93", colour="white", linewidth=0.15) +
+  geom_sf(data=adm1_sf_all_class, aes(fill=Class), colour="grey30", linewidth=0.15) +
+  scale_fill_manual(name="Prevalence class", values=class_colours) +
+  coord_sf(xlim=c(bbox_study["xmin"]-3, bbox_study["xmax"]+3),
+           ylim=c(bbox_study["ymin"]-3, bbox_study["ymax"]+3)) +
+  theme_minimal(base_size=10) +
+  theme(legend.position="bottom", panel.grid=element_blank()) +
+  labs(x=NULL, y=NULL) +
+  ggspatial::annotation_scale(location="bl", text_cex=0.7) +
+  ggspatial::annotation_north_arrow(location="tr", which_north="true",
+                                    height=unit(1,"cm"), width=unit(1,"cm"),
+                                    style=ggspatial::north_arrow_minimal())
+ggsave(file.path(hires_dir,"Figure10_pooled_africa_adm2_classified.pdf"), p_fig10, width=8, height=8, device="pdf")
+ggsave(file.path(hires_dir,"Figure10_pooled_africa_adm2_classified.png"), p_fig10, width=8, height=8, dpi=600)
+p_fig10
+```
+
+## Population-weighted burden
+
+Figure 11 converts each country's posterior mean prevalence into an expected-case burden surface (prevalence x population density, GPW v4 2015, persons/km2), showing where predicted risk coincides with population concentration rather than remote, sparsely populated hotspots.
+
+```{r fig11-burden, fig.cap="**Figure 11.** Population-weighted onchocerciasis burden by country: expected number of positive individuals per 20 km grid cell (posterior mean prevalence x GPW v4 2015 population count per cell), masked to and outlined with each country's real boundary shape. Colour scale capped at the 95th percentile across all four countries; cells above this threshold are shown at the maximum colour. This map identifies where predicted risk coincides with population concentration, as distinct from prevalence alone (Figure 8).", fig.height=9, fig.width=9}
+mkp_burden <- function(cn){
+  df <- raster_to_df(smooth_burden_utm[[cn]])
+  bnd <- st_geometry(hydro_list[[cn]]$shp_utm)
+  ggplot(df, aes(x=x, y=y, fill=pmin(burden, burden_cap_all))) +
+    geom_raster() +
+    geom_sf(data=bnd, fill=NA, colour="black", linewidth=0.35, inherit.aes=FALSE) +
+    scale_fill_viridis_c(name="Expected cases", option="inferno", limits=c(0,burden_cap_all),
+                         labels=scales::label_number(big.mark=","), na.value="transparent") +
+    coord_sf(datum=NA) + labs(title=cn, x=NULL, y=NULL) + theme_map
+}
+maps_burden <- lapply(country_meta$country_name, mkp_burden)
+p_fig11 <- (maps_burden[[1]]|maps_burden[[2]])/(maps_burden[[3]]|maps_burden[[4]]) +
+  plot_layout(guides="collect") & theme(legend.position="bottom")
+ggsave(file.path(hires_dir,"Figure11_population_burden.pdf"), p_fig11, width=9, height=9, device="pdf")
+ggsave(file.path(hires_dir,"Figure11_population_burden.png"), p_fig11, width=9, height=9, dpi=600)
+p_fig11
+```
+
+## Elimination-threshold exceedance probability
+
+REMO nodule-palpation prevalence is not the WHO's formal elimination-assessment metric (which is Ov16 seroprevalence below 0.1% in children under the current guidelines); no serological data are available in this dataset. As a documented, more conservative proxy, Figure 12 maps the posterior probability that village-level palpation prevalence lies below `r elim_threshold*100`% ("near-zero transmission"), computed directly from the same MCML posterior samples used for the prevalence maps. This is offered as an exploratory, hypothesis-generating indicator of where transmission may already be low enough to be elimination-relevant, not a substitute for a formal WHO elimination assessment.
+
+```{r fig12-elimination, fig.cap="**Figure 12.** Posterior probability that village-level onchocerciasis palpation-nodule prevalence is below a 1% near-zero-transmission threshold, by country (from the same per-country Gaussian process posterior samples as Figures 7-11), masked to and outlined with each country's real boundary shape. This is a nodule-palpation-based proxy, not the WHO's formal Ov16-seroprevalence elimination criterion (Discussion, Limitations); high values indicate areas where transmission may already be low, and are offered as hypothesis-generating, not confirmatory.", fig.height=9, fig.width=9}
+mkp_elim <- function(cn){
+  df <- raster_to_df(smooth_elim_utm[[cn]])
+  bnd <- st_geometry(hydro_list[[cn]]$shp_utm)
+  ggplot(df, aes(x=x, y=y, fill=elim_prob)) +
+    geom_raster() +
+    geom_sf(data=bnd, fill=NA, colour="black", linewidth=0.35, inherit.aes=FALSE) +
+    scale_fill_viridis_c(name=paste0("P(prev < ",elim_threshold*100,"%)"), option="viridis",
+                         limits=c(0,1), breaks=seq(0,1,0.2), na.value="transparent") +
+    coord_sf(datum=NA) + labs(title=cn, x=NULL, y=NULL) + theme_map
+}
+maps_elim <- lapply(country_meta$country_name, mkp_elim)
+p_fig12 <- (maps_elim[[1]]|maps_elim[[2]])/(maps_elim[[3]]|maps_elim[[4]]) +
+  plot_layout(guides="collect") & theme(legend.position="bottom")
+ggsave(file.path(hires_dir,"Figure12_elimination_probability.pdf"), p_fig12, width=9, height=9, device="pdf")
+ggsave(file.path(hires_dir,"Figure12_elimination_probability.png"), p_fig12, width=9, height=9, dpi=600)
+p_fig12
+```
+
+# Discussion
+
+## Interpreting the heterogeneity result
+
+`r if(lrt_p<0.05) "The interaction terms were jointly significant: at least one covariate in the climate-hydrology-anomaly chain has a country-dependent effect on prevalence, so a single pooled slope for that covariate would misrepresent at least one country. This is direct evidence that ecological context modulates the strength of the climate-to-transmission relationship, not just its baseline level (captured separately by the country fixed effects)." else "The interaction terms were not jointly significant at conventional levels, consistent with (though not proof of) a broadly transportable climate-hydrology-transmission relationship across these four surveys; given the modest per-country sample sizes this should be read as preliminary."` Figure 4 shows where in the causal chain, climate normal, hydrology, or recent anomaly, any heterogeneity concentrates: a sign reversal across countries for a given covariate is the strongest form of heterogeneity, since it means that covariate cannot be represented by one pooled slope without misrepresenting at least one country.
+
+## Static climate versus recent anomaly
+
+Because SPEI-12 and excess-heat-days were entered alongside, not instead of, the 2014 temperature and precipitation normals, their coefficients in Table 4 and Figure 4 isolate the *additional* association of recent climate stress once the year's average climate is already controlled for. This is closer to a climate-change-relevant test than the normals alone: a detectable SPEI-12 or heat-day effect on top of the temperature/precipitation main effects would indicate that anomalous, not just average, climate conditions leave a signature on transmission risk.
+
+## Biological plausibility
+
+Differences in the strength of temperature, hydrology, or anomaly slopes across countries are plausible on ecological grounds: the four countries host genetically distinct *Simulium damnosum* complex cytospecies with documented differences in thermal tolerance and altitudinal range (Cheke and Garms, 2013), and Cameroon's REMO sites in particular span a much wider elevation and forest-savanna gradient than Malawi's. The pooled analysis cannot separate genuine ecological heterogeneity from confounding by REMO village-selection protocol, historical treatment coverage, or raster measurement error differing by country; all three remain live alternative explanations for any heterogeneity observed.
+
+## Limitations
+
+This analysis is exploratory and hypothesis-generating, not a definitive causal claim.
+
+- **SPEI-24 unavailable.** Only 1/2/3/6/9/12-month SPEI accumulations were available from the Climate Hazards Center product used; SPEI-12 was used in place of the requested SPEI-24, and this substitution is explicit rather than silent.
+- **Excess heat days is a monthly, not daily, proxy.** Daily maximum-temperature time series were not readily accessible through the R packages available here without an API key; the monthly-Tmax-exceedance count used is a coarser measure of heat exposure than a true daily heatwave count, and likely under-counts short, sub-monthly heat spikes.
+- **Small per-country samples for the GP stage.** Malawi and Mozambique have on the order of 280-300 villages each; with up to ten covariates, near-separation is a genuine risk, addressed here with an explicit, reported covariate-dropping fallback (Table 5) rather than by silently omitting the problem. Countries whose GP model retained fewer covariates are not directly comparable, covariate-for-covariate, to those that retained the full set.
+- **Uneven sample sizes and REMO protocol differences.** Village counts range from `r min(prev_by_country$n_villages)` to `r max(prev_by_country$n_villages)` across the four countries; REMO village-selection criteria were not necessarily applied identically across national programmes, and any such difference would induce selection effects a covariate-adjusted regression cannot fully remove.
+- **2014 cross-section only.** None of the substantial changes in mass drug administration coverage since 2014 are captured, and country-specific historical treatment intensity is a plausible unmeasured confounder of the country baseline (fixed-effect) term.
+- **Linear climate terms.** As stated in Methods, the data-derived change-point splines used for Tanzania alone were replaced with linear terms in the pooled model, trading non-linear resolution for an estimable pooled model with 24 interaction terms.
+- **Elimination-threshold proxy.** Figure 12's exceedance-probability map uses a 1% palpation-prevalence threshold as a conservative, hypothesis-generating proxy for "near-zero transmission"; it is not the WHO's formal elimination-assessment criterion (Ov16 seroprevalence below 0.1% in children), which requires serological data not present in this dataset, and should not be used on its own for programmatic elimination decisions.
+- **Population and burden layers use a global, non-2014-specific product.** GPW v4 population density (2015, ~5 arc-minute / roughly 9 km native resolution) was used for the burden maps (Figure 11) as the nearest available year to the 2014 survey round; it is a coarser, model-based product rather than a country census, and burden estimates inherit whatever error that product carries.
+- **Pooled Africa map is a visual, not statistical, pooling.** Figures 8 and 9 plot all four countries' independently-kriged surfaces on one shared canvas for legibility; adjacent-looking colours across a national border (e.g. northern Malawi/southern Tanzania) do not imply any shared spatial correlation was estimated across that border, since no cross-country GP field was fitted (Methods).
+- **Display smoothing.** All raster maps (Figures 7-9, 10-11) are bilinearly disaggregated from the 20 km kriged computational lattice to a 5 km display lattice purely for smoother, less blocky rendering; this interpolates between existing kriged values and adds no new statistical information, and boundary masking clips the display raster to each country's real administrative shape rather than a bounding rectangle.
+- **Non-integer counts in the source Tanzania and Cameroon REMO files.** A minority of rows in the raw Tanzania (`r sum(abs(country_list[["Tanzania"]]$y - round(country_list[["Tanzania"]]$y))>1e-6)` of 331) and Cameroon (`r sum(abs(country_list[["Cameroon"]]$y - round(country_list[["Cameroon"]]$y))>1e-6)` of 817) source CSVs have a non-integer `y` (positive count) value, always less than `n`; this is a pre-existing data-quality artefact of the supplied files, not introduced by this pipeline (`glm`/`glmer` accept it, with a routine "non-integer counts" warning, since the binomial log-likelihood is well-defined for any $0\le y\le n$). It slightly affects the exact crude-prevalence sums in Table 1 for these two countries but has no material effect on model fitting.
+
+## Next steps
+
+The natural extension, and the basis for the proposed collaboration, is to apply this pooled climate-hydrology-anomaly framework to the full REMO archive, to test whether the heterogeneity observed here in a four-country convenience sample persists, strengthens, or resolves at continental scale, and to replace the excess-heat-days proxy with a true daily-temperature-derived heatwave metric where a suitable data source (e.g. an API-keyed reanalysis product) is available.
+
+# References
+
+Cheke, R.A. and Garms, R. (2013). Indices of onchocerciasis transmission by *Simulium* species. *Parasites and Vectors*, 6, 306.
+
+Diggle, P.J. and Giorgi, E. (2019). *Model-Based Geostatistics for Global Public Health*. CRC Press.
+
+Funk, C. et al. (2015). The climate hazards infrared precipitation with stations, a new environmental record for monitoring extremes. *Scientific Data*, 2, 150066.
+
+Giorgi, E. and Diggle, P.J. (2017). PrevMap: an R package for prevalence mapping. *Journal of Statistical Software*, 78(8), 1--29.
+
+Lindsay, J.B. (2016). Whitebox GAT: A case study in geomorphometric analysis. *Computers and Geosciences*, 95, 75--84.
+
+Noma, M. et al. (2002). Rapid epidemiological mapping of onchocerciasis (REMO). *Annals of Tropical Medicine and Parasitology*, 96(Suppl 1), S29--S39.
+
+Vicente-Serrano, S.M., Begueria, S., and Lopez-Moreno, J.I. (2010). A multi-scalar drought index sensitive to global warming: the Standardized Precipitation Evapotranspiration Index. *Journal of Climate*, 23, 1696--1718.

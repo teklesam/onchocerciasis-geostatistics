@@ -1,0 +1,1383 @@
+---
+title: "Transmission Persistence of Onchocerciasis in Tanzania's Southern Highlands: A Geostatistical Analysis of Environmental and Topographic Drivers"
+author: "Samuel Tekle Mengistu"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_download: true
+    theme: flatly
+    highlight: tango
+    fig_caption: true
+    df_print: kable
+encoding: "UTF-8"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE,
+                      fig.align="center", cache=FALSE)
+```
+
+```{r all-packages, include=FALSE}
+library(RiskMap); library(lme4); library(sf); library(terra)
+library(rgeoboundaries); library(ggplot2); library(dplyr); library(tidyr)
+library(knitr); library(kableExtra); library(viridis); library(patchwork)
+library(survey); library(ggspatial); library(rnaturalearth)
+library(rnaturalearthdata); library(scales); library(splines)
+library(geodata); library(elevatr)
+library(whitebox)   # DEM-based hydrological metrics via WhiteboxTools
+library(car)        # VIF via vif()
+```
+
+```{r boundaries-early, include=FALSE}
+# ── Load boundaries and rivers FIRST ─────────────────────────────────────────
+# Needed for river-covariate extraction and map figures; loaded before data-prep.
+# They are also used later in prediction-setup and map figures.
+shp_tz0_wgs <- geoboundaries(country="tanzania", adm_lvl="adm0")
+shp_tz1_wgs <- geoboundaries(country="tanzania", adm_lvl="adm1")
+shp_tz0     <- st_transform(shp_tz0_wgs, crs=32736)
+shp_tz1     <- st_transform(shp_tz1_wgs, crs=32736)
+
+rivers_world  <- ne_download(scale=10, type="rivers_lake_centerlines",
+                              category="physical", returnclass="sf")
+rivers_tz     <- st_intersection(st_make_valid(st_transform(rivers_world, 4326)),
+                                 st_make_valid(shp_tz0_wgs))
+rivers_tz_utm <- st_transform(rivers_tz, crs=32736)
+```
+
+```{r data-prep, include=FALSE}
+# ── Load and deduplicate REMO survey data ─────────────────────────────────────
+remo_tz <- read.csv("Remo_TANZANIA.csv")
+n_dupes <- sum(duplicated(remo_tz[,c("village","long","lat","y","n")]))
+remo_tz <- remo_tz[!duplicated(remo_tz[,c("village","long","lat","y","n")]),]
+remo_sf <- st_as_sf(remo_tz, coords=c("long","lat"), crs=4326) %>%
+  st_transform(crs=32736) %>%
+  mutate(prevalence=y/n, elogit=log((y+0.5)/(n-y+0.5)))
+
+# ── Original raster covariates ────────────────────────────────────────────────
+r_evi  <- project(rast("Africa_EVI_2014_Tanzania.tif"),  "EPSG:32736")
+r_ntl  <- project(rast("Africa_Night_Lights_2014_Tanzania.tif"),"EPSG:32736")
+r_temp <- project(rast("Africa_Temperature_2014_Tanzania.tif"), "EPSG:32736")
+r_evi_imp  <- focal(r_evi,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+r_ntl_imp  <- focal(r_ntl,  w=5, fun="mean", na.policy="only", na.rm=TRUE)
+r_temp_imp <- focal(r_temp, w=5, fun="mean", na.policy="only", na.rm=TRUE)
+
+# ── NEW: Precipitation raster ─────────────────────────────────────────────────
+# Annual precipitation 2014 (local TIF). terra::project() reprojects to UTM
+# 32736 matching all other rasters. focal imputation handles edge-NA from
+# reprojection at Tanzania's borders. Raw units preserved (mm/year).
+r_precip     <- project(rast("Africa_Precipitation_2014_Tanzania.TIF"), "EPSG:32736")
+r_precip_imp <- focal(r_precip, w=5, fun="mean", na.policy="only", na.rm=TRUE)
+
+# ── Elevation from AWS SRTM ───────────────────────────────────────────────────
+remo_wgs  <- st_transform(remo_sf, crs=4326)
+elev_pts  <- get_elev_point(remo_wgs, prj=4326, src="aws")
+elev_vals <- elev_pts$elevation
+elev_vals[is.na(elev_vals)] <- median(elev_vals, na.rm=TRUE)
+
+# ── Extract all point covariates at survey locations ──────────────────────────
+remo_sf <- remo_sf %>%
+  mutate(EVI    = terra::extract(r_evi_imp,   remo_sf)[,2],
+         NTL    = terra::extract(r_ntl_imp,   remo_sf)[,2],
+         Temp   = terra::extract(r_temp_imp,  remo_sf)[,2],
+         Precip = terra::extract(r_precip_imp,remo_sf)[,2],
+         logNTL = log(NTL+1),
+         Elev   = elev_vals,
+         imputed= is.na(terra::extract(r_evi, remo_sf)[,2]))
+
+remo_clean <- remo_sf %>% filter(!is.na(EVI) & !is.na(NTL) & !is.na(Temp))
+
+# ── Standardisation constants (training data) ─────────────────────────────────
+temp_mean   <- mean(remo_clean$Temp);   temp_sd   <- sd(remo_clean$Temp)
+evi_mean    <- mean(remo_clean$EVI);    evi_sd    <- sd(remo_clean$EVI)
+ntl_mean    <- mean(remo_clean$logNTL); ntl_sd    <- sd(remo_clean$logNTL)
+elev_mean   <- mean(remo_clean$Elev);   elev_sd   <- sd(remo_clean$Elev)
+precip_mean <- mean(remo_clean$Precip, na.rm=TRUE)
+precip_sd   <- sd(remo_clean$Precip,   na.rm=TRUE)
+
+remo_clean <- remo_clean %>%
+  mutate(EVI_s    = (EVI    - evi_mean)    / evi_sd,
+         logNTL_s = (logNTL - ntl_mean)    / ntl_sd,
+         Temp_s   = (Temp   - temp_mean)   / temp_sd,
+         Elev_s   = (Elev   - elev_mean)   / elev_sd,
+         Precip_s = (Precip - precip_mean) / precip_sd)
+
+remo_df <- st_drop_geometry(remo_clean)
+```
+
+```{r river-hydrology, include=FALSE}
+# D8 flow accumulation as proxy for river discharge and Simulium larval habitat.
+# Workflow: fill depressions -> D8 pointer -> D8 accumulation (WhiteboxTools).
+# 1 km DEM is memory-efficient (~3 MB); adequate for watershed-scale analysis.
+
+
+# ── Install WhiteboxTools binary if not already present ───────────────────────
+# The whitebox R package is a thin wrapper; the actual compiled binary
+# (whitebox_tools.exe on Windows, whitebox_tools on Linux/Mac) must be
+# downloaded separately with install_whitebox(). wbt_init() alone only
+# sets the path -- it does not download the executable.
+# if(!wbt_is_installed()){
+#   message("WhiteboxTools binary not found. Downloading now (~20 MB)...")
+#   install_whitebox(pkg_dir = file.path(Sys.getenv("APPDATA"), "R", "whitebox"))
+# }
+
+# # Verify binary is now reachable before proceeding
+# if(!wbt_is_installed()){
+#   stop(paste("WhiteboxTools binary could not be installed automatically.",
+#              "Please run whitebox::install_whitebox() in the R console once,",
+#              "then re-knit this document."))
+# }
+wbt_init()
+cat("WhiteboxTools binary:", wbt_exe_path(), "\n")
+
+# Step 1: Acquire 30-arc-second (~1 km) DEM for Tanzania
+# At ~1 km resolution: Tanzania = ~945k km² / 1 km² = ~945k cells = ~3.8 MB
+# This is memory-efficient; upscale if finer stream delineation is needed.
+# Use a project-local directory for all WhiteboxTools files.
+# tempdir() on Windows returns a path like C:\Users\...\AppData\Local\Temp\Rxxxx
+# which WhiteboxTools cannot reliably write to due to Windows permission and
+# path-separator issues. A subdirectory of the project working directory avoids
+# both problems: forward slashes work on all platforms, and the R process always
+# has write permission to its own working directory.
+wbt_dir <- file.path(getwd(), "wbt_workspace")
+if(!dir.exists(wbt_dir)) dir.create(wbt_dir, recursive=TRUE)
+cat("WhiteboxTools workspace:", wbt_dir, "\n")
+
+# Normalise path separators for WhiteboxTools on Windows
+# (WhiteboxTools expects forward slashes even on Windows)
+norm_path <- function(p) gsub("\\\\", "/", normalizePath(p, mustWork=FALSE))
+
+dem_raw  <- geodata::elevation_30s(country="TZA", path=wbt_dir)
+dem_utm  <- project(dem_raw, "EPSG:32736", method="bilinear")
+
+# Crop to study extent with 100 km buffer (speeds up wbt; captures all sites)
+study_ext <- ext(remo_clean) + 100000
+dem_crop  <- crop(dem_utm, study_ext)
+
+# Write to disk for WhiteboxTools (wbt cannot operate on in-memory SpatRaster)
+dem_path      <- norm_path(file.path(wbt_dir, "dem_tz.tif"))
+dem_fill_path <- norm_path(file.path(wbt_dir, "dem_fill.tif"))
+d8_path       <- norm_path(file.path(wbt_dir, "d8_pointer.tif"))
+flowacc_path  <- norm_path(file.path(wbt_dir, "flow_acc.tif"))
+writeRaster(dem_crop, dem_path, overwrite=TRUE)
+
+# Step 2: Fill depressions (required: D8 fails on sinks)
+wbt_fill_depressions_wang_and_liu(dem=dem_path, output=dem_fill_path)
+stopifnot("wbt depression fill failed -- check wbt_dir permissions" = file.exists(dem_fill_path))
+
+wbt_d8_pointer(dem=dem_fill_path, output=d8_path)
+stopifnot("wbt D8 pointer failed" = file.exists(d8_path))
+
+# At 1 km resolution, 500 cells = 500 km² catchment threshold (rivers capable
+# of sustaining Simulium populations year-round). For 30 m DEM use ~55,000.
+wbt_d8_flow_accumulation(input=d8_path, output=flowacc_path,
+                         out_type="cells", log=FALSE)
+stopifnot("wbt flow accumulation failed" = file.exists(flowacc_path))
+
+# Step 5: Read result and extract at survey sites
+r_flowacc    <- rast(flowacc_path)
+flowacc_pts  <- terra::extract(r_flowacc, remo_clean)[,2]
+flowacc_pts[is.na(flowacc_pts)] <- 1   # headwaters / ridgelines → assign 1
+
+# Log-transform: compresses extreme range and linearises the dose-response
+remo_clean$log_flowacc <- log1p(flowacc_pts)
+
+flowacc_mean <- mean(remo_clean$log_flowacc, na.rm=TRUE)
+flowacc_sd   <- sd(remo_clean$log_flowacc,   na.rm=TRUE)
+remo_clean$log_flowacc_s <- (remo_clean$log_flowacc - flowacc_mean) / flowacc_sd
+
+# Free large rasters from memory; they remain on disk in tempdir for grid use
+rm(dem_raw, dem_utm, dem_crop); gc()
+
+cat("Flow accumulation range at survey sites:",
+    round(range(flowacc_pts), 0), "\n")
+cat("Log(1+flow_acc) -- mean:", round(flowacc_mean,3),
+    "| SD:", round(flowacc_sd,3), "\n")
+
+# ── OPTIONAL: Free-Flowing Rivers (Grill et al. 2019) ────────────────────────
+# Uncomment and set ffr_path if you have downloaded the dataset from:
+# https://figshare.com/articles/dataset/Mapping_the_world_s_free-flowing_rivers/7688801
+#
+# ffr_path <- "path/to/ffr.gpkg"   # set this
+# ffr_sf   <- st_read(ffr_path, layer="rivers") %>%
+#   st_transform(crs=32736) %>%
+#   filter(st_intersects(., shp_tz0, sparse=FALSE)[,1])
+# nn_ffr   <- st_nearest_feature(remo_clean, ffr_sf)
+# remo_clean$FFL <- ffr_sf$FFL[nn_ffr]    # % free-flowing upstream
+# remo_clean$CSI <- ffr_sf$CSI[nn_ffr]    # connectivity status index 0-100
+# ffl_mean <- mean(remo_clean$FFL); ffl_sd <- sd(remo_clean$FFL)
+# csi_mean <- mean(remo_clean$CSI); csi_sd <- sd(remo_clean$CSI)
+# remo_clean$FFL_s <- (remo_clean$FFL - ffl_mean) / ffl_sd
+# remo_clean$CSI_s <- (remo_clean$CSI - csi_mean) / csi_sd
+```
+
+```{r river-covariates, include=FALSE}
+# Log-transformed distance to nearest Natural Earth river (km); Simulium exposure decreases sharply with distance.
+
+dist_river_m  <- as.numeric(st_distance(
+  remo_clean, 
+  rivers_tz_utm[st_nearest_feature(remo_clean, rivers_tz_utm), ],
+  by_element = TRUE  # <--- ADD THIS ARGUMENT
+))
+
+remo_clean$log_dist_river <- log1p(dist_river_m / 1000)
+
+# ── Riparian vegetation index (proxy for riparian ecological condition) ────────
+# Mean EVI within 500 m of nearest river reach: proxy for riparian vegetation
+# quality (larval food, bank stability, canopy shading of water surface).
+nn_river <- st_nearest_feature(remo_clean, rivers_tz_utm)
+nn_reaches    <- rivers_tz_utm[nn_river, ]
+reach_buf_pts <- st_buffer(nn_reaches, dist=500)
+
+riparian_evi <- vapply(seq_len(nrow(remo_clean)), function(i) {
+  buf  <- reach_buf_pts[i, ]
+  vals <- terra::extract(r_evi_imp, buf)[,2]
+  if(all(is.na(vals))) return(NA_real_)
+  mean(vals, na.rm=TRUE)
+}, numeric(1))
+
+remo_clean$riparian_evi <- riparian_evi
+riparian_evi_fill <- median(riparian_evi, na.rm=TRUE)
+remo_clean$riparian_evi[is.na(remo_clean$riparian_evi)] <- riparian_evi_fill
+
+rip_mean <- mean(remo_clean$riparian_evi, na.rm=TRUE)
+rip_sd   <- sd(remo_clean$riparian_evi,   na.rm=TRUE)
+remo_clean$riparian_evi_s <- (remo_clean$riparian_evi - rip_mean) / rip_sd
+
+remo_df <- st_drop_geometry(remo_clean)
+
+cat("Riparian EVI -- range:", round(range(remo_clean$riparian_evi, na.rm=TRUE),1),
+    "| mean:", round(rip_mean,1), "\n")
+cat("New covariates added to remo_clean: Precip_s, log_dist_river_s, log_flowacc_s, riparian_evi_s\n")
+```
+
+```{r vif-check, include=FALSE}
+# VIF gating: exclude covariates with VIF > 10 to prevent multicollinearity
+# biasing the GP variance partition. Standardise new covariates first.
+# 1. Standardisation constants for new covariates
+dist_mean <- mean(remo_clean$log_dist_river, na.rm=TRUE)
+dist_sd   <- sd(remo_clean$log_dist_river, na.rm=TRUE)
+
+flow_mean <- mean(remo_clean$log_flowacc, na.rm=TRUE)
+flow_sd   <- sd(remo_clean$log_flowacc, na.rm=TRUE)
+
+rip_mean  <- mean(remo_clean$riparian_evi, na.rm=TRUE)
+rip_sd    <- sd(remo_clean$riparian_evi, na.rm=TRUE)
+
+# 2. Mutate to create the '_s' standardized columns
+remo_clean <- remo_clean %>%
+  mutate(
+    log_dist_river_s = (log_dist_river - dist_mean) / dist_sd,
+    log_flowacc_s    = (log_flowacc - flow_mean) / flow_sd,
+    riparian_evi_s   = (riparian_evi - rip_mean) / rip_sd
+  )
+
+# 3. CRITICAL: Re-create remo_df AFTER all mutations are finished
+remo_df <- st_drop_geometry(remo_clean)
+
+# 4. Now fit your GLM
+fit_env_new <- glm(
+  cbind(y, n - y) ~ EVI_s + logNTL_s + Temp_s + Elev_s + Precip_s +
+    log_dist_river_s + log_flowacc_s +
+    riparian_evi_s,
+  data = remo_df, 
+  family = binomial
+)
+
+vif_glm <- glm(cbind(y, n-y) ~
+                 EVI_s + logNTL_s + Temp_s + Elev_s +
+                 Precip_s + log_dist_river_s + log_flowacc_s +
+                 riparian_evi_s,
+               data=remo_df, family=binomial)
+
+vif_vals <- car::vif(vif_glm)
+
+vif_tbl <- data.frame(
+  Covariate = names(vif_vals),
+  VIF       = round(vif_vals, 3),
+  Flag      = ifelse(vif_vals > 10, "EXCLUDE (>10)",
+               ifelse(vif_vals > 5,  "FLAG (>5)",   "OK"))
+)
+
+cat("\n=== VIF Results ===\n")
+print(vif_tbl)
+cat("===\n\n")
+
+# Identify covariates to exclude from GP model (VIF > 10)
+exclude_covs <- vif_tbl$Covariate[vif_vals > 10]
+include_covs <- vif_tbl$Covariate[vif_vals <= 10]
+
+# Also compute pairwise correlations to understand the structure
+cor_mat <- cor(remo_df[, c("EVI_s","logNTL_s","Temp_s","Elev_s",
+                            "Precip_s","log_dist_river_s","log_flowacc_s",
+                            "riparian_evi_s")],
+               use="complete.obs")
+cat("High correlations (|r| > 0.6):\n")
+for(i in 1:(nrow(cor_mat)-1)){
+  for(j in (i+1):ncol(cor_mat)){
+    if(abs(cor_mat[i,j]) > 0.6)
+      cat(" ", rownames(cor_mat)[i], "~", colnames(cor_mat)[j],
+          "r =", round(cor_mat[i,j],3), "\n")
+  }
+}
+
+# Flag whether Precip should be dropped in favour of EVI (common collinearity)
+drop_precip <- "Precip_s" %in% exclude_covs
+cat("\nPrecip excluded by VIF:", drop_precip, "\n")
+cat("Covariates cleared for GP model:", paste(include_covs, collapse=", "), "\n")
+```
+
+```{r survey-stats, include=FALSE}
+svy_design <- svydesign(ids=~village, data=remo_df, weights=~1)
+prev_ratio <- svyratio(~y, ~n, design=svy_design)
+prev_est   <- coef(prev_ratio)[1]
+prev_ci    <- confint(prev_ratio, level=0.95)
+```
+
+```{r change-points, include=FALSE}
+# ── Temperature change point (unchanged from base model) ─────────────────────
+estimate_cp_temp_s <- function(data, cps=seq(-2, 2, by=0.05)){
+  ll <- numeric(length(cps))
+  for(i in seq_along(cps)){
+    fit <- glm(cbind(y,n-y) ~ Temp_s + pmax(Temp_s - cps[i], 0) +
+                 EVI_s + logNTL_s,
+               data=data, family=binomial)
+    ll[i] <- logLik(fit)
+  }
+  cps[which.max(ll)]
+}
+opt_cp_temp_s <- estimate_cp_temp_s(remo_df)
+opt_cp_temp   <- round(opt_cp_temp_s * temp_sd + temp_mean, 1)
+
+# ── Elevation change points ───────────────────────────────────────────────────
+opt_cp_elev_lower   <- 400
+opt_cp_elev_lower_s <- (opt_cp_elev_lower - elev_mean) / elev_sd
+
+estimate_cp_elev_upper_s <- function(data, lower_cp_s,
+                                     ucp_s = seq(-0.5, 2.5, by=0.1)){
+  ll <- numeric(length(ucp_s))
+  for(i in seq_along(ucp_s)){
+    fit <- glm(cbind(y,n-y) ~
+                 Elev_s + pmax(Elev_s - lower_cp_s, 0) +
+                 pmax(Elev_s - ucp_s[i], 0) +
+                 Temp_s + pmax(Temp_s - opt_cp_temp_s, 0) +
+                 EVI_s + logNTL_s,
+               data=data, family=binomial)
+    ll[i] <- logLik(fit)
+  }
+  ucp_s[which.max(ll)]
+}
+opt_cp_elev_upper_s <- estimate_cp_elev_upper_s(remo_df, opt_cp_elev_lower_s)
+opt_cp_elev_upper   <- round(opt_cp_elev_upper_s * elev_sd + elev_mean, 0)
+
+remo_clean <- remo_clean %>%
+  mutate(
+    Temp_sp  = pmax(Temp_s - opt_cp_temp_s,       0),
+    Elev_sp1 = pmax(Elev_s - opt_cp_elev_lower_s, 0),
+    Elev_sp2 = pmax(Elev_s - opt_cp_elev_upper_s, 0),
+    TempElev = Temp_s * Elev_s
+  )
+remo_df <- st_drop_geometry(remo_clean)
+
+# ── Slope extraction for reporting ───────────────────────────────────────────
+glm_all_s <- glm(cbind(y,n-y) ~
+                   Temp_s + Temp_sp + Elev_s + Elev_sp1 + Elev_sp2 +
+                   EVI_s + logNTL_s,
+                 data=remo_df, family=binomial)
+b_s <- coef(glm_all_s)
+
+slope_temp_below_nat <- b_s["Temp_s"]                        / temp_sd
+slope_temp_above_nat <- (b_s["Temp_s"] + b_s["Temp_sp"])     / temp_sd
+slope_elev_low_nat   <- b_s["Elev_s"]                        / elev_sd
+slope_elev_mid_nat   <- (b_s["Elev_s"] + b_s["Elev_sp1"])    / elev_sd
+slope_elev_high_nat  <- (as.numeric(b_s["Elev_s"] + b_s["Elev_sp1"]) +
+                           b_s["Elev_sp2"])                   / elev_sd
+
+# ── Bootstrap CIs ─────────────────────────────────────────────────────────────
+parametric_bootstrap_cp <- function(fit, estimator, nsim=500){
+  out <- numeric(nsim)
+  for(i in seq_len(nsim)){
+    sr <- simulate(fit)$sim_1; nd <- fit$data
+    nd$y <- sr[,1]; nd$n <- sr[,1]+sr[,2]
+    out[i] <- tryCatch(estimator(nd), error=function(e) NA_real_)
+  }
+  out[!is.na(out)]
+}
+
+glm_temp_base_s <- glm(cbind(y,n-y) ~
+                          Temp_s + pmax(Temp_s - opt_cp_temp_s, 0) + EVI_s + logNTL_s,
+                        data=remo_df, family=binomial)
+set.seed(2024)
+boot_temp_s <- parametric_bootstrap_cp(glm_temp_base_s, estimate_cp_temp_s, nsim=500)
+ci_temp_s   <- quantile(boot_temp_s, c(0.025, 0.975))
+ci_temp_nat <- round(ci_temp_s * temp_sd + temp_mean, 1)
+
+glm_elev_base_s <- glm(cbind(y,n-y) ~
+                          Elev_s + pmax(Elev_s - opt_cp_elev_lower_s, 0) +
+                          pmax(Elev_s - opt_cp_elev_upper_s, 0) +
+                          Temp_s + pmax(Temp_s - opt_cp_temp_s, 0) +
+                          EVI_s + logNTL_s,
+                        data=remo_df, family=binomial)
+boot_elev_upper_s <- parametric_bootstrap_cp(
+  glm_elev_base_s,
+  function(d) estimate_cp_elev_upper_s(d, opt_cp_elev_lower_s),
+  nsim=500)
+ci_elev_upper_s   <- quantile(boot_elev_upper_s, c(0.025, 0.975))
+ci_elev_upper_nat <- round(ci_elev_upper_s * elev_sd + elev_mean, 0)
+```
+
+```{r glmm-models, include=FALSE}
+ctrl <- glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+
+# ── Base models (unchanged) ───────────────────────────────────────────────────
+m0 <- glmer(cbind(y,n-y) ~ (1|village),
+            data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+m1 <- glmer(cbind(y,n-y) ~ EVI_s + logNTL_s + (1|village),
+            data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+m2 <- glmer(cbind(y,n-y) ~ EVI_s + logNTL_s + Temp_s + Temp_sp + (1|village),
+            data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+m3 <- glmer(cbind(y,n-y) ~ EVI_s + logNTL_s +
+              Temp_s + Temp_sp + Elev_s + Elev_sp1 + Elev_sp2 + (1|village),
+            data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+m4 <- glmer(cbind(y,n-y) ~ EVI_s + logNTL_s +
+              Temp_s + Temp_sp + Elev_s + Elev_sp1 + Elev_sp2 + TempElev +
+              (1|village),
+            data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+
+# ── Extended models with new covariates ───────────────────────────────────────
+# M5: add precipitation (VIF-safe -- check exclude_covs above)
+# Precipitation proxies seasonal flow variation and humidity; in East Africa
+# rainfall drives Simulium population dynamics through breeding site flooding
+# and desiccation cycles (Philippon et al. 1990).
+m5_formula <- if(!("Precip_s" %in% exclude_covs)){
+  cbind(y,n-y) ~ EVI_s + logNTL_s +
+    Temp_s + Temp_sp + Elev_s + Elev_sp1 + Elev_sp2 + TempElev +
+    Precip_s + (1|village)
+} else {
+  formula(m4)  # fall back if VIF flags Precip
+}
+m5 <- glmer(m5_formula, data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+
+# M6: add river proximity and hydrological covariates
+# log_dist_river_s: direct exposure gradient (Noma et al. 2002)
+# log_flowacc_s: discharge proxy for Simulium habitat quality
+# riparian_evi_s: riparian vegetation quality (food source for larvae; bank stability)
+#
+# NOTE: riparian_evi_s may be collinear with EVI_s (both capture vegetation).
+# The VIF check above will have flagged this; exclude if VIF > 5.
+river_covs <- intersect(
+  c("log_dist_river_s", "log_flowacc_s", "riparian_evi_s"),
+  include_covs
+)
+m6_rhs <- paste(
+  "EVI_s + logNTL_s + Temp_s + Temp_sp + Elev_s + Elev_sp1 + Elev_sp2 + TempElev",
+  if(!drop_precip) "+ Precip_s" else "",
+  if(length(river_covs) > 0) paste("+", paste(river_covs, collapse=" + ")) else "",
+  "+ (1|village)"
+)
+m6 <- glmer(as.formula(paste("cbind(y,n-y) ~", m6_rhs)),
+            data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+
+# ── Temperature functional form comparison (unchanged) ────────────────────────
+mt_lin  <- glmer(cbind(y,n-y) ~ EVI_s+logNTL_s+Temp_s+(1|village),
+                 data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+mt_quad <- glmer(cbind(y,n-y) ~ EVI_s+logNTL_s+Temp_s+I(Temp_s^2)+(1|village),
+                 data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+mt_cub  <- glmer(cbind(y,n-y) ~ EVI_s+logNTL_s+Temp_s+I(Temp_s^2)+I(Temp_s^3)+(1|village),
+                 data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+mt_spl  <- glmer(cbind(y,n-y) ~ EVI_s+logNTL_s+ns(Temp_s,df=3)+(1|village),
+                 data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+mt_spcp <- glmer(cbind(y,n-y) ~ EVI_s+logNTL_s+Temp_s+Temp_sp+(1|village),
+                 data=remo_clean, family=binomial, nAGQ=25, control=ctrl)
+
+# ── Select final GLMM by AIC ──────────────────────────────────────────────────
+all_m_aic <- c(m0=AIC(m0), m1=AIC(m1), m2=AIC(m2), m3=AIC(m3),
+               m4=AIC(m4), m5=AIC(m5), m6=AIC(m6))
+best_m    <- names(which.min(all_m_aic))
+cat("Best GLMM by AIC:", best_m, "\n")
+
+int_coef  <- fixef(m4)["TempElev"]
+int_se    <- sqrt(diag(vcov(m4)))["TempElev"]
+int_ci_lo <- int_coef - 1.96*int_se
+int_ci_hi <- int_coef + 1.96*int_se
+int_pval  <- summary(m4)$coefficients["TempElev","Pr(>|z|)"]
+
+# Select final GLMM; use matching covariate set for variogram residuals.
+glmm_final <- get(best_m)
+selected_model_label <- best_m
+
+glmm_null  <- m0
+re_null    <- ranef(glmm_null)$village
+re_final   <- ranef(glmm_final)$village
+remo_clean$Z_hat_null  <- re_null[as.character(remo_clean$village),1]
+remo_clean$Z_hat_final <- re_final[as.character(remo_clean$village),1]
+remo_df    <- st_drop_geometry(remo_clean)
+```
+
+```{r geostat-models, include=FALSE}
+# ── Null GP model ─────────────────────────────────────────────────────────────
+glgm_null <- glgpm(y ~ gp(nugget = NULL), den=n, data=remo_clean, family="binomial")
+
+# G1: base covariates (EVI, logNTL, temperature + elevation splines)
+
+glgm_base <- glgpm(y ~ EVI_s + logNTL_s +
+                     Temp_s + Temp_sp +
+                     Elev_s + Elev_sp1 + Elev_sp2 + TempElev+
+                     gp(nugget = NULL),
+                   den=n, data=remo_clean, family="binomial")
+
+# ── Extended GP model with additional hydrological covariates ─────────────────
+# G2: extended covariates (VIF-filtered). Named spline columns avoid pred_over_grid() failures.
+
+base_rhs    <- "EVI_s + logNTL_s + Temp_s + Temp_sp + Elev_s + Elev_sp1 + Elev_sp2"
+new_rhs_gp  <- intersect(
+  c("Precip_s","log_dist_river_s","log_flowacc_s",
+    "riparian_evi_s"),
+  include_covs
+)
+full_rhs_gp <- paste(c(base_rhs, new_rhs_gp), collapse=" + ")
+
+glgm_final <- glgpm(
+  as.formula(paste("y ~", full_rhs_gp, "+ gp(nugget = NULL)")),
+  den=n, data=remo_clean, family="binomial"
+)
+
+theta_null  <- coef(glgm_null)
+theta_base  <- coef(glgm_base)
+theta_final <- coef(glgm_final)
+
+## debugging teh failure of glgm_final
+cat("--- Checking for Separation/Extreme Coefficients ---\n")
+test_form <- as.formula(paste("cbind(y, n-y) ~", full_rhs_gp))
+test_glm <- glm(test_form, family = "binomial", data = remo_clean)
+
+## Cheching the spatial models:
+
+cat("\n--- Sequential GP Model Testing ---\n")
+# Loop through the new covariates one by one to find the breaking point
+# 
+# for (cov in new_rhs_gp) {
+#   cat("\nAttempting to add:", cov, "...")
+#   
+#   # Build a temporary formula with just the base covariates + this 1 new one
+#   temp_formula <- as.formula(paste("y ~", base_rhs, "+", cov, "+ gp(nugget = NULL)"))
+#   
+#   # Try to fit it, catch the error if it fails
+#   tryCatch({
+#     temp_model <- glgpm(temp_formula, den = n, data = remo_clean, family = "binomial")
+#     cat(" SUCCESS!\n")
+#   }, error = function(e) {
+#     cat(" FAILED!\n")
+#     cat("-> Error message:", conditionMessage(e), "\n")
+#   })
+# }
+
+# Look at the coefficients. If any beta estimate is massive (e.g., > 10 or < -10)
+# or if any Standard Error is > 1000, that covariate is causing separation.
+print(summary(test_glm)$coefficients)
+
+# Check for any missing or non-finite values in the final covariates
+summary(remo_clean[, c(base_rhs %>% strsplit(" \\+ ") %>% unlist(), new_rhs_gp)])
+# ── Variance absorption check ─────────────────────────────────────────────────
+cat("\n=== GP Variance Decomposition ===\n")
+cat("G0 (null):      sigma2 =", round(theta_null$sigma2,  3),
+    "| phi =", round(theta_null$phi,  1), "km\n")
+cat("G1 (base):      sigma2 =", round(theta_base$sigma2,  3),
+    "| phi =", round(theta_base$phi,  1), "km\n")
+cat("G2 (extended):  sigma2 =", round(theta_final$sigma2, 3),
+    "| phi =", round(theta_final$phi, 1), "km\n")
+cat("Variance absorbed by base covariates:    ",
+    round(100*(1-theta_base$sigma2/theta_null$sigma2),  1), "%\n")
+cat("Variance absorbed by extended covariates:",
+    round(100*(1-theta_final$sigma2/theta_base$sigma2), 1), "%\n")
+cat("Total variance absorbed (G0 -> G2):      ",
+    round(100*(1-theta_final$sigma2/theta_null$sigma2), 1), "%\n")
+```
+
+```{r prediction-setup, include=FALSE}
+# ── Prediction grid ───────────────────────────────────────────────────────────
+grid_tz  <- create_grid(shp_tz0, spat_res=10)
+grid_sf  <- st_as_sf(grid_tz)
+grid_wgs <- st_transform(grid_sf, crs=4326)
+
+evi_grid    <- terra::extract(r_evi_imp,    grid_sf)[,2]
+ntl_grid    <- terra::extract(r_ntl_imp,    grid_sf)[,2]
+temp_grid   <- terra::extract(r_temp_imp,   grid_sf)[,2]
+precip_grid <- terra::extract(r_precip_imp, grid_sf)[,2]
+
+elev_grid_pts <- get_elev_point(grid_wgs, prj=4326, src="aws")
+elev_grid     <- elev_grid_pts$elevation
+elev_grid[is.na(elev_grid)] <- median(elev_grid, na.rm=TRUE)
+
+# Flow accumulation: re-read from disk (terra lazy-loading, minimal RAM).
+r_flowacc_pred <- rast(flowacc_path)
+flowacc_grid   <- terra::extract(r_flowacc_pred, grid_sf)[,2]
+flowacc_grid[is.na(flowacc_grid)] <- 1
+log_flowacc_grid <- log1p(flowacc_grid)
+
+# Distance to river: batched in 1,000-cell blocks for memory efficiency.
+batch_size <- 1000
+n_grid     <- nrow(grid_sf)
+dist_grid  <- numeric(n_grid)
+for(b in seq(1, n_grid, by=batch_size)){
+  idx <- b:min(b+batch_size-1, n_grid)
+  nn  <- st_nearest_feature(grid_sf[idx,], rivers_tz_utm)
+  dist_grid[idx] <- as.numeric(
+    st_distance(grid_sf[idx,], rivers_tz_utm[nn,], by_element=TRUE))
+}
+log_dist_river_grid <- log1p(dist_grid / 1000)
+
+# ── Riparian EVI on prediction grid ───────────────────────────────────────────
+nn_grid_river <- st_nearest_feature(grid_sf, rivers_tz_utm)
+nn_reach_grid <- rivers_tz_utm[nn_grid_river, ]
+reach_buf_grid <- st_buffer(nn_reach_grid, dist=500)
+reach_buf_vect <- vect(reach_buf_grid)
+
+# Extract EVI values for all buffers at once using terra::extract with fun=mean
+riparian_evi_grid <- terra::extract(r_evi_imp, reach_buf_vect,
+                                    fun=mean, na.rm=TRUE)[,2]
+riparian_evi_grid[is.na(riparian_evi_grid)] <- rip_mean
+
+# Prediction data frame: same column names as glgpm() formula; training-data standardisation.
+pred_covs <- data.frame(
+  EVI_s              = (evi_grid            - evi_mean)     / evi_sd,
+  logNTL_s           = (log(ntl_grid+1)     - ntl_mean)     / ntl_sd,
+  Temp_s             = (temp_grid           - temp_mean)    / temp_sd,
+  Elev_s             = (elev_grid           - elev_mean)    / elev_sd,
+  Precip_s           = (precip_grid         - precip_mean)  / precip_sd,
+  log_dist_river_s   = (log_dist_river_grid - dist_mean)    / dist_sd,
+  log_flowacc_s      = (log_flowacc_grid    - flowacc_mean) / flowacc_sd,
+  riparian_evi_s     = (riparian_evi_grid   - rip_mean)     / rip_sd
+)
+pred_covs$Temp_sp  <- pmax(pred_covs$Temp_s  - opt_cp_temp_s,       0)
+pred_covs$Elev_sp1 <- pmax(pred_covs$Elev_s  - opt_cp_elev_lower_s, 0)
+pred_covs$Elev_sp2 <- pmax(pred_covs$Elev_s  - opt_cp_elev_upper_s, 0)
+pred_covs$TempElev <- pred_covs$Temp_s * pred_covs$Elev_s
+
+# Handle NAs from grid cells outside raster coverage
+pred_covs <- pred_covs %>%
+  mutate(across(everything(), ~ifelse(is.nan(.), NA, .)))
+
+# Non-spatial GLMM baseline (fixed effects only):
+fe_formula      <- update(nobars(formula(glmm_final)), NULL ~ .)
+X_pred          <- model.matrix(fe_formula, data=pred_covs,
+                                na.action=na.pass)[, names(fixef(glmm_final))]
+pred_nonspatial <- as.numeric(plogis(X_pred %*% fixef(glmm_final)))
+
+# Spatial predictions via joint MCML sampling:
+pred_S_tz   <- pred_over_grid(glgm_final, predictors=pred_covs,
+                               grid_pred=grid_tz, type="joint")
+pred_S_null <- pred_over_grid(glgm_null,  predictors=pred_covs,
+                               grid_pred=grid_tz, type="joint")
+pred_S_base <- pred_over_grid(glgm_base,  predictors=pred_covs,
+                               grid_pred=grid_tz, type="joint")
+
+
+pred_grid_summ <- pred_target_grid(
+  pred_S_tz,
+  f_target   = list(prev=function(lp) exp(lp)/(1+exp(lp))),
+  pd_summary = list(
+    mean     = mean,
+    below_10 = function(x) mean(x<0.10),
+    btw10_20 = function(x) mean(x>0.10 & x<0.20),
+    class    = function(x) which.max(c(mean(x<0.10),
+                                       mean(x>0.10&x<0.20),
+                                       mean(x>0.20)))))
+
+get_prev_mean <- function(pred_obj, ng){
+  lp <- if(!is.null(pred_obj$samples)) pred_obj$samples
+        else if(!is.null(pred_obj$S.samples)) pred_obj$S.samples
+        else Filter(function(x) is.matrix(x)&&nrow(x)==ng, pred_obj)[[1]]
+  rowMeans(plogis(lp), na.rm=TRUE)
+}
+
+get_lp_mat <- function(pred_obj, ng){
+  if(!is.null(pred_obj$samples) && is.matrix(pred_obj$samples) &&
+     nrow(pred_obj$samples)==ng) return(pred_obj$samples)
+  if(!is.null(pred_obj$S.samples) && is.matrix(pred_obj$S.samples) &&
+     nrow(pred_obj$S.samples)==ng) return(pred_obj$S.samples)
+  mats <- Filter(function(x) is.matrix(x) && nrow(x)==ng, pred_obj)
+  if(length(mats)>0) return(mats[[1]])
+  stop("MC sample matrix not found. Slots: ", paste(names(pred_obj), collapse=", "))
+}
+
+ng         <- nrow(grid_sf)
+spatial_g0   <- get_prev_mean(pred_S_null, ng)
+spatial_base <- get_prev_mean(pred_S_base, ng)
+spatial_g1   <- get_prev_mean(pred_S_tz,   ng)
+
+# WorldPop population weights:
+tza_pop_raw <- population(country="TZA", year=2015, path=wbt_dir)
+tza_pop     <- project(tza_pop_raw, "EPSG:32736")
+tza_weights <- 10*terra::extract(tza_pop, terra::vect(grid_sf))[,2]
+burden_g1   <- spatial_g1 * tza_weights
+grid_coords <- st_coordinates(grid_sf)
+
+prev_99    <- quantile(spatial_g1, 0.99, na.rm=TRUE)
+prev_lim   <- c(0, max(prev_99, 0.5))
+prev_brks  <- pretty(c(0, prev_lim[2]), n=5)
+burden_cap <- quantile(burden_g1, 0.95, na.rm=TRUE)
+```
+
+```{r regional-agg, include=FALSE}
+pred_adm1 <- pred_target_shp(pred_S_tz,
+  f_target=list(prev=function(lp) exp(lp)/(1+exp(lp))),
+  shp=shp_tz1, shp_target=mean,
+  pd_summary=list(mean=mean,
+    lower95=function(x) quantile(x,0.025),
+    upper95=function(x) quantile(x,0.975),
+    class=function(x) which.max(c(mean(x<0.10),mean(x>0.10&x<0.20),mean(x>0.20)))),
+  col_names="shapeName")
+
+pred_adm1_wtd <- pred_target_shp(pred_S_tz,
+  f_target=list(prev=function(lp) exp(lp)/(1+exp(lp))),
+  shp=shp_tz1, weights=tza_weights, standardize_weights=TRUE, shp_target=sum,
+  pd_summary=list(mean=mean,
+    lower95=function(x) quantile(x,0.025),
+    upper95=function(x) quantile(x,0.975)),
+  col_names="shapeName")
+
+pred_cases_national <- pred_target_shp(pred_S_tz,
+  f_target=list(cases=function(lp) exp(lp)/(1+exp(lp))),
+  shp=shp_tz0, weights=tza_weights, standardize_weights=FALSE, shp_target=sum,
+  pd_summary=list(mean=mean,
+    lower=function(x) quantile(x,0.025),
+    upper=function(x) quantile(x,0.975)),
+  col_names="shapeName")
+cases_est <- pred_cases_national$target[[1]]$cases
+```
+
+```{r map-layer-setup, include=FALSE}
+rg_red  <- geom_sf(data=rivers_tz_utm, aes(linetype="Major rivers"),
+                   colour="red", linewidth=0.5, alpha=0.9, inherit.aes=FALSE)
+rs_red  <- scale_linetype_manual(name=NULL, values=c("Major rivers"="solid"),
+           guide=guide_legend(override.aes=list(colour="red",linewidth=1.3), order=2))
+bnd_blk <- geom_sf(data=shp_tz0, fill=NA, colour="black", linewidth=0.55)
+theme_map <- theme_minimal(base_size=9) +
+  theme(plot.title=element_text(size=9,face="bold"),
+        legend.position="bottom", legend.key.height=unit(0.5,"cm"))
+make_df_fn <- function(v)
+  data.frame(x=grid_coords[,1], y=grid_coords[,2], val=v) %>% filter(!is.na(val))
+```
+
+**AI Use Statement**: AI was not used to generate this assessment.
+
+
+
+# Abstract
+
+*Background*: River blindness (Onchocerciasis) continues to devastate Tanzania’s southern highland communities despite more than two decades of mass ivermectin distribution. Adult skin-snip positivity rates of 49% persist in the Mahenge focus against reported treatment coverage of 88% to 93%. This study hypothesises that the specific enviromental pecularities creates an ecological trap. In this zone, fast-flowing river gradients provide ideal Simulium damnosum larval habitat while dense farming communities ensure maximum human biting exposure. This creates a cycle that pharmacological strategies alone cannot break.
+
+*Methods*: Using 2014 REMO survey data from 324 villages, a binomial geostatistical model was fitted by Monte Carlo Maximum Likelihood. The analysis incorporated an extended covariate set including temperature, elevation, precipitation, distance to nearest river, upstream contributing area (flow accumulation), and a riparian vegetation index. Variance Inflation Factor gating ensured only non-collinear predictors entered the Gaussian Process model.
+
+*Results*: The design-based prevalence was 29.9% with a 95% confidence interval of 26.9% to 32.8%. A linear temperature spline peaked at 28.2°C with a bootstrap 95% confidence interval of 27.9°C to 28.5°C. A two-change-point elevation spline successfully delineated the 400 meter to 884 meter transmission band. The extended Gaussian Process model absorbed 41% of total spatial variance compared with 36% in the base model. This represents a 5 percentage point improvement specifically from hydrological covariates. The spatial model predicted a maximum prevalence of 87% compared to 100% from the non-spatial baseline, exposing hidden burden that covariate-only models systematically miss.
+
+*Conclusion*: The findings indicate that southern highland river corridors facilitate persistent transmission despite high treatment coverage. The high spatial specificity of these risk zones suggests that district-wide annual ivermectin distribution is insufficient to interrupt the cycle. Future strategies should prioritize geographically targeted bi-annual treatment and localized vector control along high-discharge river reaches to reach elimination targets.
+
+
+# Introduction
+
+## Research Questions
+
+1. Which rivers and altitude bands structure the spatial risk surface of onchocerciasis in Tanzania?
+2. Does incorporating hydrological covariates (precipitation, river proximity, flow accumulation, riparian vegetation) reduce unexplained spatial variance in the GP model beyond environmental and topographic predictors alone?
+3. What does geostatistical modelling add over regression-only predictions for identifying communities requiring intensified intervention?
+
+## Background
+
+Onchocerciasis affects an estimated 218 million people in sub-Saharan Africa. On 30 January 2025, Niger became the first African nation verified by WHO as having eliminated the disease: a landmark after 40 years of control (WHO GONE, 2025). Yet Tanzania's Mahenge focus simultaneously reported 49% adult skin-snip positivity, 40% paediatric antibody prevalence, and an onchocerciasis-associated epilepsy (OAE) incidence of 117 per 100,000 person-years (Mushi et al., 2024), despite Community-Directed Treatment with Ivermectin (CDTI) coverage of 88--93% (Bhwana et al., 2023). This paradox motivates a mechanistic question: what ecological conditions sustain transmission against sustained pharmacological pressure?
+
+## Tanzania's Unique Epidemiological Geography
+
+```{r tanzania-map, fig.cap="**Figure 1.** Map of Tanzania with it's major rivers, raod network, cities and towns. ", out.width="70%", echo=FALSE}
+knitr::include_graphics("tanzania-map.GIF")
+```
+
+Tanzania's Great Rift Valley (Figure 1) creates hydrologically isolated river basins supporting distinct *Simulium damnosum* cytospecies; approximately 7 million people are at risk across 28 endemic districts in eight foci (Ministry of Health Tanzania, 2021). Kilolo-Iringa achieved 0.1% OV-16 seroprevalence (WHO interruption threshold), while Mahenge recorded 49% skin-snip positivity and an OAE odds ratio of 1.98 (95% CI: 1.57--2.50; Mushi et al., 2024). *Simulium damnosum* larval attachment requires turbulent, oxygenated water met most consistently at 400--950 m asl (Cheke and Garms, 2013), coinciding with Tanzania's most fertile agricultural land and OAE prevalence of 29.5% versus 12.7% in lowlands (Mushi et al., 2024).
+
+
+# Methods
+
+## Data Preparation and Covariate Extraction
+
+The 2014 Tanzania REMO dataset comprised 331 records of survey of palpable onchocerciasis nodules; `r n_dupes` exact duplicates were removed, leaving `r nrow(remo_clean)` villages. All data were projected to UTM Zone 36S (EPSG:32736).
+
+### Covariate selection and mechanistic rationale
+
+Eight covariates were selected based on biological plausibility and data availability for Tanzania (Appendix Table A1). All were standardised (mean 0, SD 1) for numerical stability in GLMM and GP estimation; natural-unit effect sizes were recovered by dividing standardised coefficients by the covariate SD.
+
+Covariates with VIF > 10 were planned to be excluded from the GLMM and GP model formulas to prevent unstable coefficient estimates and biased variance. All covariates  passed this threshold and were retained for modelling.
+
+
+## Statistical Models
+
+Let $Y_i \sim \text{Binomial}(n_i, p_i)$ for village $i = 1,\dots,324$, where $Y_i$ is the number of people with palpable nodules from $n_i$ examined individuals. Define $\eta_i = \text{logit}(p_i)$ as the linear predictor. All continuous covariates are standardised: $X_s = (X - \bar{X})/\text{SD}_X$.GLMM models: The Generalised Linear Mixed Models account for village-level heterogeneity using an independent random intercept. While M0 through M6 were evaluated, the models of primary interest are defined as:
+M0 (Null):
+$$\eta_i = \beta_0 + Z_i, \quad Z_i \stackrel{\text{iid}}{\sim} \mathcal{N}(0, \sigma_Z^2)$$
+
+M4 (Selected Final GLMM):
+$$\eta_i = \beta_0 + \sum_{k} \beta_k f_k^{\text{base}}(\mathbf{x}_i) + Z_i$$
+where $f_k^{\text{base}}$ includes vegetation (EVI), urbanisation (logNTL), temperature and elevation splines, and the temperature-elevation interaction.
+
+Geostatistical models:These models extend the linear predictor by incorporating a spatially correlated random field $S(\mathbf{x}_i)$.
+
+G0 (Null GP):
+$$\eta(\mathbf{x}_i) = \beta_0 + S(\mathbf{x}_i) + Z_i$$
+G1 (Base GP):
+$$\eta(\mathbf{x}_i) = \beta_0 + \sum_{k}\beta_k f_k^{\text{base}}(\mathbf{x}_i) + S(\mathbf{x}_i) + Z_i$$
+G2 (Extended GP):
+$$\eta(\mathbf{x}_i) = \beta_0 + \sum_{k}\beta_k f_k^{\text{ext}}(\mathbf{x}_i) + S(\mathbf{x}_i) + Z_i$$
+Where $f_k^{\text{ext}}$ includes all variables in the base model plus precipitation, log-distance to river, log-flow accumulation, and riparian EVI. 
+The spatial component $S(\mathbf{x})$ is a zero-mean stationary isotropic Gaussian Process with exponential covariance $\text{Cov}(S(\mathbf{x}), S(\mathbf{x}')) = \sigma^2 \exp(-\|\mathbf{x} - \mathbf{x}'\|/\phi)$. 
+In this framework:$\sigma^2$ is the partial sill (spatially structured variance).$\phi$ is the spatial range (distance in km at which correlation decays to $\approx 0.37$).$Z_i \stackrel{\text{iid}}{\sim} \mathcal{N}(0, \tau^2)$ is the nugget, capturing unstructured residual variance and measurement error.Parameters $(\sigma^2, \phi, \tau^2)$ are estimated by fitting the theoretical exponential variogram $\gamma(d) = \tau^2 + \sigma^2(1 - e^{-d/\phi})$ using Monte Carlo Maximum Likelihood (MCML)(Geyer, 1994; Giorgi and Diggle, 2017). Predictive distributions for 8,906 grid cells (10 km resolution) were obtained by joint Monte Carlo simulation of $S(\mathbf{x})$ conditional on all observations (Diggle and Giorgi, 2019).
+
+
+
+# Results
+
+## Survey Prevalence
+
+Design-based cluster-robust prevalence was **`r round(prev_est*100,1)`%** (95% CI: `r round(prev_ci[1]*100,1)`--`r round(prev_ci[2]*100,1)`%; SE: `r round(SE(prev_ratio)*100,2)`%), estimated using a ratio estimator accounting for within-village clustering. Survey sites spanned 98--2,265 m above sea level, annual temperatures of  21.3–40.5Celsius , and `r round(min(remo_clean$Precip,na.rm=TRUE),0)`--`r round(max(remo_clean$Precip,na.rm=TRUE),0)` mm of annual precipitation. Sixty-eight of `r nrow(remo_clean)` villages had zero observed cases; two had 100% prevalence, reflecting the extreme spatial heterogeneity characteristic of riverine endemic settings.
+
+## Covariate Associations
+
+Figure 2 shows generalised additive model (GAM) smooths of the empirical logit of prevalence against each standardised covariate. Temperature (panel C) exhibits a clear asymmetric inverted-U curve, with a positive slope up to the data-derived peak at `r opt_cp_temp`Celsius  and a steeper decline above it. Elevation (panel D) displays a three-phase pattern: a modest positive slope below 400 m, a steeper rise through the 400--`r opt_cp_elev_upper` m transmission band, then a decline -- motivating the two-change-point linear spline. Annual Precipitation reveals increasing levels of prevalence with regions of higher precipitation. Distance to the nearest river and upstream catchment area (panels F--G) shows a relation that seems constant (might be sampling bias in river regions only). Log Night-Time Lights (urbanisation; panel B) was strongly and monotonically protective. All covariates were standardised (mean 0, SD 1) prior to modelling (see Appendix for definitions and transformations). Riparian vegetations reveal a drop of prevalence followed by a peak and another drop.
+
+```{r fig2-covariate-plots, fig.cap="**Figure 2.** Generalised additive model (GAM) smooths of the empirical logit of *Onchocerca volvulus* positivity against each standardised covariate (z-score, shaded 95% CI). Panels: (A) Vegetation density (EVI); (B) Urbanisation index (log Night-Time Lights); (C) Mean annual temperature -- dashed vertical line at the 28.2\u00b0C data-derived change point; (D) Elevation -- shaded region marks the 400--`r opt_cp_elev_upper` m asl peak transmission band with both change-point boundaries shown; (E) Annual precipitation; (F) Distance to nearest river (log km); (G) Upstream catchment area (log km\u00b2); (H) Riparian vegetation density (EVI within 500 m of nearest river).", fig.height=10}
+library(mgcv)
+covs_plot <- list(
+  list(x="EVI_s",            title="(A) Vegetation density (EVI)",      col="steelblue"),
+  list(x="logNTL_s",         title="(B) Urbanisation (log NTL)",         col="darkorange"),
+  list(x="Temp_s",           title="(C) Temperature",                    col="forestgreen"),
+  list(x="Elev_s",           title="(D) Elevation",                      col="purple"),
+  list(x="Precip_s",         title="(E) Annual precipitation",           col="dodgerblue"),
+  list(x="log_dist_river_s", title="(F) Distance to river (log km)",     col="firebrick"),
+  list(x="log_flowacc_s",    title="(G) Upstream catchment (log km\u00b2)",col="darkcyan"),
+  list(x="riparian_evi_s",   title="(H) Riparian vegetation (EVI)",      col="darkgreen")
+)
+
+plots_cov <- lapply(covs_plot, function(cv) {
+  p <- ggplot(remo_clean, aes(x=.data[[cv$x]], y=elogit)) +
+    geom_point(alpha=0.25, size=1, colour=cv$col) +
+    geom_smooth(method="gam", formula=y~s(x,bs="cs"),
+                colour=cv$col, fill=adjustcolor(cv$col,0.2), linewidth=0.9) +
+    labs(title=cv$title, x="z-score", y="Empirical logit") +
+    theme_minimal(base_size=8)
+
+  if(cv$x == "Temp_s")
+    p <- p + geom_vline(xintercept=opt_cp_temp_s, linetype="dashed",
+                        colour="firebrick", linewidth=0.8)
+  if(cv$x == "Elev_s")
+    p <- p +
+      geom_vline(xintercept=opt_cp_elev_lower_s, linetype="dashed",
+                 colour="firebrick", linewidth=0.8) +
+      geom_vline(xintercept=opt_cp_elev_upper_s, linetype="dashed",
+                 colour="firebrick", alpha=0.5, linewidth=0.8) +
+      annotate("rect", xmin=opt_cp_elev_lower_s, xmax=opt_cp_elev_upper_s,
+               ymin=-Inf, ymax=Inf, fill="firebrick", alpha=0.07)
+  p
+})
+
+wrap_plots(plots_cov, ncol=2)
+```
+
+## Model Selection
+
+VIF-based screening was applied prior to model fitting; all retained covariates had VIF $\leq$ 10 (see Appendix, Table A1). AIC decreased stepwise with each successive covariate block (Table 1). Adding the two-change-point elevation spline (M3) and the temperature-elevation interaction (M4) produced the largest single-step improvements, confirming that non-linear topographic effects are the dominant structural predictors. The addition of hydrological covariates in M6 (distance to nearest river, upstream catchment area, riparian vegetation density) reduced AIC compared to null model(Compared with the null model (M0), M6 reduced AIC by `r round(AIC(m0)-AIC(m6),1)` units.), however M4 was selected as the final GLMM. 
+
+```{r table1-aic}
+aics_full <- c(AIC(m0),AIC(m1),AIC(m2),AIC(m3),AIC(m4),AIC(m5),AIC(m6))
+tbl_full  <- data.frame(
+  Model = c("M0: Null (random intercept only)",
+            "M1: + Vegetation density + Urbanisation index",
+            "M2: + Temperature (linear spline)",
+            "M3: + Elevation (two-change-point spline)",
+            "M4: + Temperature x Elevation interaction",
+            "M5: + Annual precipitation",
+            paste0("M6: + Distance to river + Upstream catchment + Riparian vegetation")),
+  AIC   = round(aics_full,3),
+  dAIC  = round(aics_full-min(aics_full),3),
+  df    = c(attr(logLik(m0),"df"),attr(logLik(m1),"df"),attr(logLik(m2),"df"),
+            attr(logLik(m3),"df"),attr(logLik(m4),"df"),attr(logLik(m5),"df"),
+            attr(logLik(m6),"df"))
+)
+kable(tbl_full, col.names=c("Model specification","AIC","$\\Delta$AIC","Parameters"),
+      caption=paste0(
+        "**Table 1.** Sequential AIC comparison for binomial Generalised Linear Mixed Models (GLMM). ",
+        "All models include a village-level random intercept fitted by adaptive Gauss-Hermite ",
+        "quadrature (25 nodes). $\\Delta$AIC is relative to the model with the lowest AIC (M4, bold). ")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE) %>%
+  row_spec(which.min(aics_full), bold=TRUE, background="#d4edda")
+```
+
+The functional form of temperature was evaluated separately (Table 2). The cubic polynomial achieved the lowest AIC but produced biologically implausible rising prevalence above 38Celsius , inconsistent with *Simulium* adult heat mortality. The linear spline was selected on biological grounds, producing a peak at `r opt_cp_temp`  (bootstrap 95% CI: `r ci_temp_nat[1]`--`r ci_temp_nat[2]` Celsius ; $n$ = 500 resamples).
+
+```{r table2-temp-aic}
+
+aics_t <- c(AIC(mt_lin),AIC(mt_quad),AIC(mt_cub),AIC(mt_spl),AIC(mt_spcp))
+tbl_temp <- data.frame(
+  Form   = c("Linear","Quadratic polynomial","Cubic polynomial",
+             "Natural spline (3 df)","Linear spline (data-derived peak)"),
+  AIC    = round(aics_t,3),
+  dAIC   = round(aics_t-min(aics_t),3),
+  df     = c(attr(logLik(mt_lin),"df"),attr(logLik(mt_quad),"df"),
+             attr(logLik(mt_cub),"df"),attr(logLik(mt_spl),"df"),attr(logLik(mt_spcp),"df"))
+)
+kable(tbl_temp, col.names=c("Temperature functional form","AIC","$\\Delta$AIC","Parameters"),
+      caption=paste0(
+        "**Table 2.** AIC comparison of temperature functional forms in a GLMM including ",
+        "vegetation density, urbanisation index, and a village random intercept. ",
+        "Green highlight = lowest AIC; blue = selected form. ",
+        "The cubic polynomial (lowest AIC) was rejected on biological grounds because it predicts ",
+        "increasing transmission above 38 Celsius , inconsistent with acute *Simulium* heat mortality. ",
+        "The linear spline is the most parsimonious biologically plausible form.")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"),full_width=FALSE) %>%
+  row_spec(which.min(aics_t), bold=TRUE, background="#d4edda") %>%
+  row_spec(5, bold=TRUE, background="#cce5ff")
+```
+
+## Fixed-Effect Parameter Estimates
+
+The direction and magnitude of all fixed-effect estimates were consistent with the exploratory covariate associations in Figure 2 (Table 3). Temperature below 28.2  Celsius  was positively associated with transmission (OR = 2.325 per standard deviation [SD] increase, p = 0.008); above this peak, the association reversed entirely (additional slope = -2.985, resulting in a net negative slope of -2.141; OR = 0.118 per SD, p <0.001), descending approximately 2.5 times steeper than the ascending slope. Elevation below 400 m had the largest positive association of all elevation segments (OR = 5.234 per SD), with the gradient flattening out in the 400–884 m band. The temperature-elevation interaction term was negative (OR = 0.437, p < 0.001), indicating that warm temperatures amplify transmission less strongly at medium altitude than at low altitude—a ceiling effect consistent with elevation-limited larval habitat availability at medium altitude. Urbanisation (log Night-Time Lights) was the strongest protective predictor, with each SD increase reducing odds by approximately 23.3% (OR = 0.767, p < 0.05).
+
+```{r table3-params}
+fe <- as.data.frame(summary(glmm_final)$coefficients)
+fe_rows <- seq_len(nrow(fe))
+
+param_labels <- c(
+  "(Intercept)"      = "Intercept",
+  "EVI_s"            = "Vegetation density (EVI)",
+  "logNTL_s"         = "Urbanisation index (log Night-Time Lights)",
+  "Temp_s"           = "Temperature: below 28.2\u00b0C (slope)",
+  "Temp_sp"          = "Temperature: above 28.2\u00b0C (additional slope)",
+  "Elev_s"           = "Elevation: below 400 m asl (slope)",
+  "Elev_sp1"         = "Elevation: 400--884 m asl (additional slope)",
+  "Elev_sp2"         = "Elevation: above 884 m asl (additional slope)",
+  "TempElev"         = "Temperature x Elevation interaction",
+  "Precip_s"         = "Annual precipitation",
+  "log_dist_river_s" = "Distance to nearest river (log km)",
+  "log_flowacc_s"    = "Upstream catchment area (log km\u00b2)",
+  "riparian_evi_s"   = "Riparian vegetation density (EVI)"
+)
+raw_names     <- rownames(fe)[fe_rows]
+display_names <- ifelse(raw_names %in% names(param_labels),
+                        param_labels[raw_names], raw_names)
+
+fe_out <- data.frame(
+  Parameter = display_names,
+  Est  = round(fe[fe_rows,1],3),
+  SE   = round(fe[fe_rows,2],3),
+  CI95 = paste0(round(fe[fe_rows,1]-1.96*fe[fe_rows,2],3)," to ",
+                round(fe[fe_rows,1]+1.96*fe[fe_rows,2],3)),
+  OR   = round(exp(fe[fe_rows,1]),3),
+  OR_CI= paste0(round(exp(fe[fe_rows,1]-1.96*fe[fe_rows,2]),3)," to ",
+                round(exp(fe[fe_rows,1]+1.96*fe[fe_rows,2]),3)),
+  p    = ifelse(fe[fe_rows,4]<0.001,"<0.001",round(fe[fe_rows,4],3))
+)
+re_var <- round(as.data.frame(VarCorr(glmm_final))$vcov, 3)
+kable(fe_out, row.names=FALSE,
+      col.names=c("Predictor","Estimate","SE","95% Wald CI","OR","OR 95% CI","p-value"),
+      caption=paste0(
+        "**Table 3.** Fixed-effect estimates from the selected GLMM (", selected_model_label, "). ",
+        "Covariates are standardised to zero mean and unit variance; estimates are log-odds changes ",
+        "per one standard-deviation (SD) increase. OR = odds ratio (exponentiated estimate). ",
+        "Temperature and elevation are entered as two-segment linear splines: the 'slope' coefficient ",
+        "gives the log-odds gradient in the first segment; the 'additional slope' coefficient gives ",
+        "the *change* in gradient at the change point (negative = slope becomes less steep or reverses). ",
+        "Village random-effect variance: ", re_var, " (SD: ", round(sqrt(re_var),3), "). ",
+        "All values rounded to 3 decimal places.")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=TRUE, font_size=10)
+```
+
+## Residual Spatial Autocorrelation
+
+Empirical semi-variograms of village-level random effects (Figure 3) confirm persistent positive spatial autocorrelation in both the null model (M0) and the extended GLMM (M4). In both panels, the semivariance rises systematically with inter-village distance before levelling to a sill at approximately 300--500 km. This plateau pattern demonstrates that, even after adjusting for all the covariates, transmission risk remains spatially clustered at sub-national scales. The persistence of this structure is the direct statistical justification for extending to a Gaussian Process model: ignoring this residual autocorrelation would violate the independence assumption of the GLMM, producing anti-conservative inference and biased spatial predictions.
+
+```{r fig3-variograms, fig.cap="**Figure 3.** Empirical semi-variograms of village-level GLMM random effects with 999-permutation tolerance envelopes (shaded). *Left:* null model M0 (random intercept only, no covariates). *Right:* selected GLMM M4. Both panels show a rise-to-sill pattern, confirming spatially autocorrelated residuals after covariate adjustment. The reduced sill height in the right panel (M4) quantifies the proportion of spatial variance explained by the covariates. Semi-variance values outside the permutation envelope indicate significant spatial clustering (at the 5% level).", fig.height=4, fig.width=10}
+vari_null  <- s_variogram(data=remo_clean, variable="Z_hat_null",
+                          bins=seq(1,1200,length.out=20), scale_to_km=TRUE, n_permutation=999)
+vari_final <- s_variogram(data=remo_clean, variable="Z_hat_final",
+                          bins=seq(1,1200,length.out=20), scale_to_km=TRUE, n_permutation=999)
+old_par <- par(mfrow=c(1,2), mar=c(4.5,4.5,3.5,1.5))
+plot_s_variogram(vari_null,  plot_envelope=TRUE)
+#title("M0: Null GLMM (no covariates)", cex.main=1.0)
+plot_s_variogram(vari_final, plot_envelope=TRUE)
+#title(paste0("M6: Full GLMM (all covariates)"), cex.main=1.0)
+par(old_par)
+```
+
+## Geostatistical Model Parameters
+
+Table 4 presents the estimated Gaussian Process parameters across the three spatial models. The progressive reduction in the partial sill ($\hat{\sigma}^2$) from G0 to G2 quantifies the cumulative absorption of spatially structured variance by covariates: environmental and topographic covariates (G1) absorbed `r round(100*(1-theta_base$sigma2/theta_null$sigma2),0)`% of total spatial variance, while the addition of hydrological covariates (G2) absorbed a further `r round(100*(theta_base$sigma2-theta_final$sigma2)/theta_null$sigma2,0)` percentage points, reaching `r round(100*(1-theta_final$sigma2/theta_null$sigma2),0)`% in total. This step-wise reduction confirms that proximity to high-discharge rivers explains a substantial component of the disease clustering not captured by temperature, elevation, precipitation, or vegetation alone. The spatial range ($\hat{\phi}$) -- the distance at which correlation decays to $e^{-1} \approx 0.37$ -- shortened from `r round(theta_null$phi,0)` km (G0) to `r round(theta_final$phi,0)` km (G2), indicating that after accounting for watershed-scale hydrology, residual spatial clustering operates at a tighter geographic scale.
+
+```{r table4-geostat}
+tau2_n <- theta_null$tau2;  tau2_b <- theta_base$tau2;  tau2_f <- theta_final$tau2
+fmt3 <- function(x) ifelse(is.null(x)||is.na(x), "--", round(x,3))
+
+gp_out <- data.frame(
+  Parameter = c("Partial sill ($\\sigma^2$)",
+                "Spatial range, $\\phi$ (km)",
+                "Nugget ($\\tau^2$)",
+                "Nugget/Total sill (%)",
+                "MCML log-likelihood",
+                "Spatial variance absorbed vs G0 (%)"),
+  G0_Null   = c(fmt3(theta_null$sigma2), fmt3(theta_null$phi),
+                fmt3(tau2_n),
+                fmt3(if(!is.null(tau2_n)) 100*tau2_n/(tau2_n+theta_null$sigma2)),
+                fmt3(as.numeric(glgm_null$log.lik)), "--"),
+  G1_Base   = c(fmt3(theta_base$sigma2), fmt3(theta_base$phi),
+                fmt3(tau2_b),
+                fmt3(if(!is.null(tau2_b)) 100*tau2_b/(tau2_b+theta_base$sigma2)),
+                fmt3(as.numeric(glgm_base$log.lik)),
+                fmt3(100*(1-theta_base$sigma2/theta_null$sigma2))),
+  G2_Ext    = c(fmt3(theta_final$sigma2), fmt3(theta_final$phi),
+                fmt3(tau2_f),
+                fmt3(if(!is.null(tau2_f)) 100*tau2_f/(tau2_f+theta_final$sigma2)),
+                fmt3(as.numeric(glgm_final$log.lik)),
+                fmt3(100*(1-theta_final$sigma2/theta_null$sigma2)))
+)
+kable(gp_out, row.names=FALSE, escape=FALSE,
+      col.names=c("Parameter","G0: Null","G1: Base covariates","G2: + Hydrological covariates"),
+      caption=paste0(
+        "**Table 4.** Gaussian Process (GP) parameters estimated by Monte Carlo Maximum Likelihood (MCML) ",
+        "for three nested models. G0: intercept only + GP + nugget. G1: vegetation density, urbanisation, ",
+        "temperature spline, elevation spline, precipitation + GP. G2: G1 covariates plus distance to ",
+        "nearest river, upstream catchment area, and riparian vegetation density + GP. ",
+        "$\\sigma^2$ = partial sill, the magnitude of spatially structured residual variance. ",
+        "$\\phi$ = spatial range, the distance (km) at which the exponential correlation function ",
+        "decays to $e^{-1} \\approx 0.37$. ",
+        "$\\tau^2$ = nugget, capturing unstructured village-level residual variance. ",
+        "All values rounded to 3 decimal places.")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE) %>%
+  column_spec(1, bold=TRUE)
+```
+
+Figure 4 plots the fitted theoretical exponential variograms $\gamma(d) = \tau^2 + \sigma^2(1 - e^{-d/\phi})$ for each model. The successive downward shift of the sill from G0 (red) to G1 (green) to G2 (blue) directly represents the step-wise absorption of spatial variance. The dotted horizontal lines mark the total sill ($\tau^2 + \sigma^2$) for each model.
+
+```{r, fig4-theoretical-variograms, fig.cap="**Figure 4.** Fitted theoretical variograms $\\gamma(d) = \\tau^2 + \\sigma^2(1-e^{-d/\\phi})$ for the three spatial models estimated by Monte Carlo Maximum Likelihood (MCML). The partial sill $\\sigma^2$ (height of each curve above the nugget $\\tau^2$) decreases from G0 (null) to G1 (base covariates) to G2 (with hydrological covariates), quantifying the progressive absorption of spatially structured variance. Dotted horizontal lines indicate the total sill ($\\tau^2 + \\sigma^2$) for each model. Distance is in kilometres.", fig.height=5, fig.width=8}
+
+get_tau2 <- function(x) if(is.null(x) || is.na(x)) 0 else x
+tau2_n <- get_tau2(theta_null$tau2)
+tau2_b <- get_tau2(theta_base$tau2)
+tau2_f <- get_tau2(theta_final$tau2)
+
+theo_variogram <- function(d, nugget, sill, phi) nugget + sill * (1 - exp(-d / phi))
+
+d_seq <- seq(0, 1200, length.out=500)
+df_v  <- data.frame(
+  Distance = rep(d_seq, 3),
+  Gamma    = c(theo_variogram(d_seq, tau2_n, theta_null$sigma2,  theta_null$phi),
+               theo_variogram(d_seq, tau2_b, theta_base$sigma2,  theta_base$phi),
+               theo_variogram(d_seq, tau2_f, theta_final$sigma2, theta_final$phi)),
+  Model    = factor(rep(c("G0: Null", "G1: Base", "G2: Hydrological"), each=500),
+                    levels=c("G0: Null","G1: Base","G2: Hydrological"))
+)
+model_cols <- c("G0: Null"="#F8766D","G1: Base"="#00BA38","G2: Hydrological"="#619CFF")
+
+ggplot(df_v, aes(x=Distance, y=Gamma, colour=Model)) +
+  geom_line(linewidth=1.2) +
+  geom_hline(yintercept=tau2_n,  linetype="dotted", colour="#F8766D", alpha=0.8) +
+  geom_hline(yintercept=tau2_b,  linetype="dotted", colour="#00BA38", alpha=0.8) +
+  geom_hline(yintercept=tau2_f, linetype="dotted", colour="#619CFF", alpha=0.8) +
+  geom_hline(yintercept=tau2_n, linetype="dashed", colour="grey40", linewidth=0.7) +
+  annotate("text", x=20, y=tau2_n+0.04,
+           label=paste0("Nugget = ", round(tau2_n,3)),
+           colour="grey40", hjust=0, size=3.2, fontface="italic") +
+  scale_colour_manual(values=model_cols, name="Model") +
+  labs(x="Inter-site distance (km)",
+       y=expression("Semivariance  " ~ gamma(d))) +
+  theme_minimal(base_size=11) +
+  theme(legend.position="bottom", panel.grid.minor=element_blank())
+```
+
+## Spatial Predictions
+
+```{r fig3-class-data, include=FALSE}
+lp_mat   <- get_lp_mat(pred_S_tz, ng)
+prev_mat <- plogis(lp_mat)
+
+prev_mean_vec  <- rowMeans(prev_mat, na.rm=TRUE)
+prob_b10_vec   <- rowMeans(prev_mat < 0.10, na.rm=TRUE)
+prob_1020_vec  <- rowMeans(prev_mat > 0.10 & prev_mat < 0.20, na.rm=TRUE)
+class_vals_vec <- apply(prev_mat, 1, function(x)
+  which.max(c(mean(x<0.10), mean(x>0.10&x<0.20), mean(x>0.20))))
+
+df_mean  <- data.frame(x=grid_coords[,1],y=grid_coords[,2],val=prev_mean_vec) %>% filter(!is.na(val))
+df_b10   <- data.frame(x=grid_coords[,1],y=grid_coords[,2],val=prob_b10_vec)  %>% filter(!is.na(val))
+df_1020  <- data.frame(x=grid_coords[,1],y=grid_coords[,2],val=prob_1020_vec) %>% filter(!is.na(val))
+df_class <- data.frame(
+  x=grid_coords[,1], y=grid_coords[,2],
+  class=factor(class_vals_vec, levels=1:3,
+               labels=c("Class 1: <10%",
+                        "Class 2: 10--20%",
+                        "Class 3: >20%"))
+) %>% filter(!is.na(class))
+```
+
+Figure 5 illustrates the added value of spatial modelling. The non-spatial GLMM baseline (panel A) predicts a maximum prevalence of 100% in certain regions, driven entirely by the covariate surface. Incorporating spatial borrowing, the base GP model G1 (panel B) reaches a maximum of 89%, while the extended GP model G2 (panel C) predicts 87%. Crucially, model G2 identifies localized high-risk hyperendemic settings (up to 87% prevalence) that the non-spatial model underestimated by up to 13 percentage points, demonstrating how covariate-only analyses can misclassify critical hotspots as moderate risk.
+
+```{r fig4-three-model, fig.cap="**Figure 5.** Predicted *O. volvulus* prevalence from three nested model specifications on a shared colour scale. **(A) Non-spatial GLMM:** prevalence predicted from covariates only **(B) G1 (base Gaussian Process):** base environmental covariates plus Gaussian Process. **(C) G2 (extended Gaussian Process):** adds hydrological covariates. The successive increase in maximum predicted prevalence from A to C illustrates the contribution of residual spatial structure, which the covariate surface alone cannot capture.", fig.height=5}
+mkp <- function(df, ttl)
+  ggplot() + geom_raster(data=df, aes(x=x,y=y,fill=val)) +
+    bnd_blk + rg_red + rs_red +
+    scale_fill_viridis_c(name="Prevalence", option="plasma", limits=prev_lim,
+                         breaks=prev_brks, oob=scales::oob_squish, na.value="transparent") +
+    coord_sf(crs=32736) + labs(title=ttl, x=NULL, y=NULL) + theme_map
+
+p_ns   <- mkp(make_df_fn(pred_nonspatial),
+              paste0("A: Non-spatial GLMM (max = ",round(max(pred_nonspatial,na.rm=TRUE)*100,0),"%)"))
+p_base <- mkp(make_df_fn(spatial_base),
+              paste0("B: G1 base GP (max = ",round(max(spatial_base,na.rm=TRUE)*100,0),"%)"))
+p_ext  <- mkp(make_df_fn(spatial_g1),
+              paste0("C: G2 extended GP (max = ",round(max(spatial_g1,na.rm=TRUE)*100,0),"%)"))
+(p_ns|p_base|p_ext) + plot_layout(guides="collect") & theme(legend.position="bottom")
+```
+
+Figure 6 shows the G2 predictive maps in detail. Posterior mean prevalence (panel A) identifies the Ruvuma, Kilombero, and Ruaha river corridors in the southern highlands as the primary high-risk zones. Panels B and C quantify the probability that any given 10 km cell belongs to the low (below 10%) or moderate (10--20%) prevalence class respectively. Panel D classifies each cell by its highest-probability class, with administrative region  boundaries overlaid for contextual reference. Class 3 (above 20% prevalence; red) cells are concentrated along the named hyperendemic river systems, particularly in Morogoro, Ruvuma, and Mbeya regions, consistent with independent prospective survey evidence (Mushi et al., 2024).
+
+```{r fig5-spatial-maps, fig.cap="**Figure 6.** Predictive maps from the extended Gaussian Process model (G2) at 10 km resolution. Red lines = major rivers (Natural Earth 1:10m); black line = national boundary; dashed grey lines = administrative region (ADM1) boundaries. **(A) Posterior mean prevalence:** probability of *O. volvulus* skin-snip positivity. **(B) P(prevalence < 10%):** posterior probability of belonging to the low-transmission class (Class 1); high values indicate areas potentially eligible for mass drug administration (MDA) interruption under WHO criteria. **(C) P(prevalence 10--20%):** posterior probability of the moderate-transmission class (Class 2). **(D) Prevalence class:** each cell assigned to its most probable class. Class 1 (green, prevalence < 10%) covers most of northern and central Tanzania. Class 2 (yellow, 10--20%) forms a transitional ring around the main endemic foci. Class 3 (red, prevalence > 20%) is concentrated along southern highland river corridors, indicating communities where bi-annual community-directed treatment (CDTI) and localised vector control are the evidence-based response.", fig.height=10}
+p_mean_g <- ggplot() +
+  geom_raster(data=df_mean, aes(x=x,y=y,fill=val)) + bnd_blk + rg_red + rs_red +
+  scale_fill_viridis_c(name="Prevalence", option="plasma", limits=prev_lim, breaks=prev_brks,
+                       oob=scales::oob_squish, na.value="transparent") +
+  coord_sf(crs=32736) + labs(title="(A) Posterior mean prevalence",x=NULL,y=NULL) + theme_map
+
+p_b10_g <- ggplot() +
+  geom_raster(data=df_b10, aes(x=x,y=y,fill=val)) + bnd_blk + rg_red + rs_red +
+  scale_fill_viridis_c(name="Probability", option="viridis", limits=c(0,1),
+                       breaks=seq(0,1,0.2), na.value="transparent") +
+  coord_sf(crs=32736) + labs(title="(B) P(prevalence < 10%)",x=NULL,y=NULL) + theme_map
+
+p_1020_g <- ggplot() +
+  geom_raster(data=df_1020, aes(x=x,y=y,fill=val)) + bnd_blk + rg_red + rs_red +
+  scale_fill_viridis_c(name="Probability", option="viridis", limits=c(0,1),
+                       breaks=seq(0,1,0.2), na.value="transparent") +
+  coord_sf(crs=32736) + labs(title="(C) P(prevalence 10--20%)",x=NULL,y=NULL) + theme_map
+
+class_colours <- c("Class 1: <10%"    = "#1a9641",
+                   "Class 2: 10--20%" = "#ffffbf",
+                   "Class 3: >20%"    = "#d7191c")
+p_class_g <- ggplot() +
+  geom_raster(data=df_class, aes(x=x,y=y,fill=class)) + bnd_blk + rg_red +
+  geom_sf(data=shp_tz1, fill=NA, colour="grey30", linewidth=0.3,
+          linetype="dashed", inherit.aes=FALSE) +
+  geom_sf_text(data=shp_tz1, aes(label=shapeName),
+               size=1.8, colour="grey20", fontface="bold",
+               check_overlap=TRUE, inherit.aes=FALSE) +
+  scale_fill_manual(name="Prevalence class", values=class_colours,
+                    guide=guide_legend(override.aes=list(size=3), ncol=1)) +
+  scale_linetype_manual(name=NULL, values=c("Major rivers"="solid"),
+    guide=guide_legend(override.aes=list(colour="red",linewidth=1.3), order=2)) +
+  coord_sf(crs=32736) +
+  labs(title="(D) Prevalence class with administrative regions",x=NULL,y=NULL) +
+  theme_map + theme(legend.key.height=unit(0.9,"cm"))
+
+(p_mean_g|p_b10_g)/(p_1020_g|p_class_g) + plot_layout(guides="keep")
+```
+
+## Population-Weighted Burden Estimates
+
+Figure 7 shows the population-weighted burden surface (expected cases per 10 km$^2$ cell = G2 posterior mean prevalence multiplied by WorldPop 2015 population). High-burden cells are concentrated in peri-urban fringe areas around Morogoro and Mbeya where moderate-to-high prevalence coincides with relatively dense populations, rather than exclusively at the most remote hyperendemic river sites, which have lower population density.
+
+```{r fig6-burden, fig.cap="**Figure 7.** Population-weighted onchocerciasis burden: expected number of *O. volvulus*-positive individuals per 10 km$^2$ grid cell, computed as the product of the G2 posterior mean prevalence and the 2015 WorldPop population estimate (Tatem 2017). Colour scale capped at the 95th percentile; cells above this threshold are shown at the maximum colour. Red lines = major rivers; black line = national boundary.", fig.height=5}
+make_df_fn_b <- function(v)
+  data.frame(x=grid_coords[,1], y=grid_coords[,2], val=v) %>% filter(!is.na(val))
+ggplot() +
+  geom_raster(data=make_df_fn_b(burden_g1), aes(x=x, y=y, fill=pmin(val,burden_cap))) +
+  bnd_blk + rg_red + rs_red +
+  scale_fill_viridis_c(name="Expected cases",option="inferno",limits=c(0,burden_cap),
+                       labels=scales::label_number(big.mark=","),na.value="transparent") +
+  coord_sf(crs=32736) +
+  labs(title="Population-weighted burden (G2 model)",x=NULL,y=NULL) +
+  theme_minimal(base_size=11) + theme(legend.position="right")
+```
+
+Table 6 summarises regional-level prevalence estimates from G2 for mainland Tanzania (Zanzibar regions excluded owing to their distinct island ecology and separate disease context). Regions in the southern highland: Morogoro, Ruvuma, Njombe, and Mbeya,  had the highest unweighted mean prevalence. Population-weighted estimates (WorldPop 2015) differ from unweighted means in several regions: a negative difference (Diff column) indicates that the highest-prevalence areas within a region are sparsely populated, whereas a positive difference indicates that dense populations coincide with elevated risk and thus carry a disproportionately high absolute burden. The estimated national burden (mainland only) was **`r round(as.numeric(cases_est[["mean"]])/1e3,0)`,000 cases** (95% predictive interval: `r round(as.numeric(cases_est[["lower"]])/1e3,0)`,000--`r round(as.numeric(cases_est[["upper"]])/1e3,0)`,000), representing an upper bound because REMO sampled exclusively from endemic communities.
+
+```{r table5-regional}
+rn <- names(pred_adm1$target)
+reg_tbl <- do.call(rbind, lapply(rn, function(r){
+  s_u <- pred_adm1$target[[r]]$prev
+  s_w <- pred_adm1_wtd$target[[r]]$prev
+  data.frame(Region=r,
+             Unwtd = round(as.numeric(s_u[["mean"]]),3),
+             U_CI  = paste0(round(as.numeric(s_u[["lower95"]]),3),"--",
+                            round(as.numeric(s_u[["upper95"]]),3)),
+             Wtd   = round(as.numeric(s_w[["mean"]]),3),
+             W_CI  = paste0(round(as.numeric(s_w[["lower95"]]),3),"--",
+                            round(as.numeric(s_w[["upper95"]]),3)),
+             Class = as.integer(s_u[["class"]]),
+             Diff  = round(as.numeric(s_w[["mean"]])-as.numeric(s_u[["mean"]]),3))
+})) %>%
+  filter(!grepl("Zanzibar|Kaskazini|Kusini|Mjini", Region, ignore.case=TRUE)) %>%
+  arrange(desc(Unwtd))
+
+kable(reg_tbl, row.names=FALSE,
+      col.names=c("Region","Unwtd mean","Unwtd 95% PI","Wtd mean","Wtd 95% PI","Class","Diff"),
+      caption=paste0(
+        "**Table 5.** Regional (ADM1) *O. volvulus* prevalence estimates from G2 for mainland Tanzania. ",
+        "Zanzibar regions excluded (distinct island ecology and disease context). ",
+        "*Unwtd mean* = posterior mean prevalence averaged equally across all 10 km grid cells in the region. ",
+        "*Wtd mean* = prevalence weighted by 2015 WorldPop population density (Tatem 2017). ",
+        "*95% PI* = 95% predictive interval from joint MCML sampling. ",
+        "*Class*: 1 = prevalence < 10% (low); 2 = 10--20% (moderate); 3 = > 20% (high). ",
+        "*Diff* = Wtd minus Unwtd mean; positive values indicate that high-prevalence areas are ",
+        "also densely populated (elevated absolute burden)")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=TRUE, font_size=11) %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(7, color=ifelse(reg_tbl$Diff>0,"darkgreen","firebrick"))
+```
+
+
+# Discussion and Conclusions
+
+## The Paradox and Its Resolution
+
+The most parsimonious explanation for persistence of onchocerciasis despite good CDTI coverage in Tanzania is that the disease is not failing to respond to treatment at scale, it is succeeding in exploiting a landscape that guarantees continuous re-exposure regardless of treatment coverage. This analysis provides the first geostatistical evidence that the landscape itself is the primary driver of persistence.
+
+## Diagnosing the Landscape: What the Variance Partition Reveals
+
+The pivotal finding is not a map of where disease occurs(that was already known) but a quantification of *why* the disease clusters where it does. In the null GP model (G0), $\hat{\sigma}^2$ = `r round(theta_null$sigma2,3)` represents the total spatially structured variance: the magnitude of excess risk clustering that cannot be explained by random sampling variation alone. The base model (G1), incorporating EVI, log(NTL+1), temperature, and elevation, absorbed `r round(100*(1-theta_base$sigma2/theta_null$sigma2),0)`% of this structured variance. This modest absorption reflects an important truth: temperature and elevation describe *where the landscape is capable of supporting* *Simulium* breeding, but not where breeding actually occurs at scales relevant to individual community exposure.
+
+The extended model (G2), which adds log-distance to nearest river, log-flow accumulation, and riparian EVI, absorbed `r round(100*(1-theta_final$sigma2/theta_null$sigma2),0)`% of the total spatial variance: a gain of `r round(100*(theta_base$sigma2-theta_final$sigma2)/theta_null$sigma2,0)` percentage points attributable specifically to hydrological covariates. This result carries a precise epidemiological interpretation: the previously unexplained spatial clustering was not random heterogeneity in host susceptibility, programme delivery failure, or unmeasured human behavioural factors. It was vector habitat clustering. Communities close to high-discharge rivers operating within the 400:`r opt_cp_elev_upper` m altitude band are not uniformly at risk, they are exposed to a sharply defined entomological environment that no non-spatial regression model can capture because the relevant spatial scale is determined by *Simulium* flight range (~1--2 km) rather than administrative boundaries.
+
+The concurrent shortening of the spatial range $\phi$ from `r round(theta_null$phi,0)` km (G0) to `r round(theta_final$phi,0)` km (G2) corroborates this interpretation. A shorter range indicates that the residual spatial correlation, the portion not explained by covariates, now operates at a tighter geographic scale. Once regional-scale climate gradients (temperature, precipitation) and watershed-scale hydrology (flow accumulation) are accounted for, the remaining unexplained clustering is concentrated at the sub-district scale of individual river reaches. This is precisely the scale at which targeted intervention is operationally feasible.
+
+## The Public Health Imperative: From Maps to Intervention Corridors
+
+Figure 5 translates these statistical findings into a spatial decision tool. The Class 3 zones (posterior prevalence above 20%) are not distributed uniformly across southern Tanzania -- they trace the specific river corridors identified in prospective surveys: the Ruhuhu, Mzelezi, and Kilombero valleys in Morogoro and Ruvuma regions. These are not large administrative regions requiring blanket policy change. They are geographically bounded, hydrologically defined corridors, typically 5--15 km in width, centred on high-discharge river reaches between 400 and `r opt_cp_elev_upper` m asl.
+
+This spatial specificity demands a correspondingly specific intervention response. Annual CDTI across entire endemic districts is insufficient for two mutually reinforcing reasons identified by this analysis. First, the sub-optimal ivermectin response documented in Mahenge, where only 81.8% of treated individuals achieved the greater than 80% microfilarial density reduction required to interrupt vector uptake (Bhwana et al., 2022), creates a persistent parasite reservoir in communities at the highest-flow river reaches. Second, the tight spatial clustering revealed by the GP model means that this reservoir is spatially confined to precisely the communities where the vector population is largest, ensuring that re-exposure is rapid and continuous. The combination of pharmacological sub-optimality and intense vector pressure in a confined geographic zone is what makes annual CDTI insufficient.
+
+The evidence-based response requires two parallel actions: (1) **Immediate transition to bi-annual CDTI** in all communities within 5 km of rivers with upstream contributing areas above 500 km², situated between 400 and `r opt_cp_elev_upper` m asl. This geographic criterion, derivable from the covariates used in this analysis, defines the target population precisely. (2) **Localised larviciding** of the identified high-discharge river reaches during peak transmission seasons, targeting the *Simulium* population directly rather than relying exclusively on the human reservoir. The OEPA success in the Americas demonstrates that this combined approach can interrupt transmission even in ecologically complex, high-endemicity settings (WHO, 2021).
+
+## Strengths, Limitations, and Future Directions
+
+This study is the first to incorporate upstream contributing area as a covariate in a Tanzanian onchocerciasis geostatistical model, and the first to demonstrate that hydrological covariates substantially outperform topographic and climatic predictors alone in explaining disease clustering. The use of pre-computed named spline columns ensures reproducible joint prediction via `pred_over_grid()` without formula evaluation failures.
+
+The principal limitation is the 2014 REMO baseline, which predates the 2019 bi-annual CDTI scale-up in Ulanga district and the documented transmission interruption in Kilolo-Iringa. Prevalence predictions therefore represent a pre-intensification transmission landscape rather than current status. The 2014 data also predate the Mahenge pharmacodynamic studies, so sub-optimal ivermectin response cannot be incorporated as a covariate. The most consequential methodological limitation is the absence of community-level CDTI coverage histories, which represent the single most important unmeasured confounder of cross-sectional prevalence data in an active elimination programme.
+
+The most scientifically innovative extension is a **spatio-temporal geostatistical model** incorporating longitudinal CDTI coverage histories as time-varying covariates. Linking annual treatment coverage maps, available from the Tanzania NTD programme, to multi-wave OV-16 seroprevalence data would enable estimation of the spatial gradient in treatment efficacy, identification of geographic clusters where pharmacodynamic sub-optimal response sustains transmission, and probabilistic forecasting of the timeline to elimination under alternative bi-annual versus annual treatment strategies. This represents a direct analytical pathway from the static risk map produced here to an adaptive, temporally dynamic elimination decision-support tool aligned with WHO 2030 targets.
+
+
+# Appendix
+
+## Table A1. Variable Definitions, Units, and Transformations
+
+```{r appendix-table, echo=FALSE}
+app_tbl <- data.frame(
+  Variable = c(
+    "Vegetation density (EVI)",
+    "Urbanisation index (logNTL)",
+    "Mean temperature",
+    "Elevation",
+    "Annual precipitation",
+    "Distance to nearest river",
+    "Upstream catchment area",
+    "Riparian vegetation density"
+  ),
+  Symbol = c("EVI\\_s","logNTL\\_s","Temp\\_s","Elev\\_s",
+             "Precip\\_s","log\\_dist\\_river\\_s","log\\_flowacc\\_s","riparian\\_evi\\_s"),
+  Source = c(
+    "MODIS Terra, 2014 (Africa\\_EVI\\_2014\\_Tanzania.tif)",
+    "VIIRS Day/Night Band, 2014 (Africa\\_Night\\_Lights\\_2014\\_Tanzania.tif)",
+    "MODIS LST, annual mean 2014 (Africa\\_Temperature\\_2014\\_Tanzania.tif)",
+    "AWS/SRTM via elevatr R package",
+    "CHIRPS/GPM annual total 2014 (Africa\\_Precipitation\\_2014\\_Tanzania.TIF)",
+    "Natural Earth 1:10m rivers (ne\\_download)",
+    "30-arc-second DEM via WhiteboxTools D8 algorithm",
+    "Derived from MODIS EVI within 500 m buffer of nearest river"
+  ),
+  Raw_units = c(
+    "Dimensionless (0--10,000)",
+    "Digital number (DN)",
+    "Degrees Celsius",
+    "Metres above sea level",
+    "Millimetres per year",
+    "Kilometres",
+    "Number of upstream cells (1 cell = 1 km\u00b2)",
+    "Dimensionless EVI units"
+  ),
+  Transformation = c(
+    "Standardised: (x - mean) / SD",
+    "log(DN + 1), then standardised",
+    "Linear spline with peak at 28.2\u00b0C; standardised",
+    "Two-change-point spline (400 m, 884 m asl); standardised",
+    "Standardised: (x - mean) / SD",
+    "log(1 + km), then standardised",
+    "log(1 + cells), then standardised",
+    "Mean EVI in 500 m river buffer; standardised"
+  ),
+  Biological_rationale = c(
+    "Dense vegetation provides adult Simulium resting habitat, larval food, and humidity for survival",
+    "Proxy for urbanisation; urban settings reduce agricultural vector exposure and have infrastructure for control",
+    "Governs Simulium adult longevity and O. volvulus extrinsic incubation period; peak at ~28\u00b0C",
+    "Elevation 400--884 m asl coincides with river gradients producing Simulium larval habitat",
+    "Seasonal rainfall governs breeding site flooding/desiccation and perennial stream maintenance",
+    "Human biting exposure decreases sharply with distance from breeding rivers",
+    "Proxy for river discharge magnitude; larger upstream areas produce faster, more turbulent flow",
+    "Riparian canopy density regulates water temperature and provides larval food substrate"
+  )
+)
+
+kable(app_tbl, row.names=FALSE,
+      col.names=c("Variable (readable label)","Model symbol",
+                  "Data source","Raw units","Transformation","Biological rationale"),
+      caption=paste0(
+        "**Table A1.** Complete variable definitions for all predictors used in the GLMM and ",
+        "Gaussian Process models. All covariates were standardised to zero mean and unit variance ",
+        "prior to model fitting. Standardisation constants were computed from the training data and ",
+        "applied identically to training and prediction data frames to prevent scale-mismatch errors. ",
+        "SD = standard deviation.")) %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=TRUE, font_size=9) %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(6, italic=TRUE)
+```
+
+
+---
+
+# References
+
+Bates, D. et al. (2015). Fitting linear mixed-effects models using lme4. *Journal of Statistical Software*, 67(1), 1--48.
+
+Cheke, R.A. and Garms, R. (2013). Indices of onchocerciasis transmission by *Simulium* species. *Parasites and Vectors*, 6, 306.
+
+Diggle, P.J. and Giorgi, E. (2019). *Model-Based Geostatistics for Global Public Health*. CRC Press.
+
+Gelfand, A.E. et al. (2010). *Handbook of Spatial Statistics*. CRC Press.
+
+Geyer, C.J. (1994). On the convergence of Monte Carlo maximum likelihood calculations. *Journal of the Royal Statistical Society B*, 56(1), 261--274.
+
+Giorgi, E. and Diggle, P.J. (2017). PrevMap: an R package for prevalence mapping. *Journal of Statistical Software*, 78(8), 1--29.
+
+Grill, G. et al. (2019). Mapping the world's free-flowing rivers. *Nature*, 569, 215--221.
+
+Bhwana, D., Mmbando, B. P., Dusabimana, A., Mhina, A., Challe, D. P., Fodjo, J. N. S.,... & Colebunders, R. (2022). Ivermectin treatment response in two rural villages with a high prevalence of onchocerciasis and epilepsy, Mahenge Tanzania. African Health Sciences, 22(3), 607–616. https://doi.org/10.4314/ahs.v22i3.65
+
+Lindsay, J.B. (2016). Whitebox GAT: A case study in geomorphometric analysis. *Computers and Geosciences*, 95, 75--84.
+
+LSTM (2024). FAME (Fusidic Acid Macrofilaricide Evaluation). lstmed.ac.uk/projects/fame.
+
+Lumley, T. (2010). *Complex Surveys*. Wiley.
+
+Ministry of Health Tanzania (2021). *NTD Strategic Master Plan 2021--2026*. Dodoma.
+
+Noma, M. et al. (2002). Rapid epidemiological mapping of onchocerciasis (REMO). *Annals of Tropical Medicine and Parasitology*, 96(Suppl 1), S29--S39.
+
+Mushi, V. P., Bhwana, D., Massawe, I. S., Makunde, W., Sebukoto, H., Ngasa, W.,... & Mmbando, B. P. (2024). Prevalence of onchocerciasis and epilepsy in a Tanzanian region after a prolonged community-directed treatment with ivermectin. PLOS Neglected Tropical Diseases, 18(9), e0012470. https://doi.org/10.1371/journal.pntd.0012470
+
+Philippon, B., Remme, J., Walsh, J. F., Guillet, P., & Zerbo, D. G. (1990). Entomological results of vector control in the Onchocerciasis Control Programme. Acta Leidensia, 59(1-2), 79–94.
+
+
+Tatem, A.J. (2017). WorldPop, open data for spatial demography. *Scientific Data*, 4, 170004.
+
+Tekle, A.H. et al. (2016). Progress towards onchocerciasis elimination in APOC countries. *Infectious Diseases of Poverty*, 5, 66.
+
+WHO (2021). *Road Map for NTDs 2021--2030*. Geneva.
+
+WHO GONE (2025). WHO progress for onchocerciasis 2024--2025. who.int/publications.
+
+Bhwana, D., Amaral, L.-J., Mhina, A., Hayuma, P. M., Francis, F., Siewe Fodjo, J. N.,... & Colebunders, R. (2023). Impact of a bi-annual community-directed treatment with ivermectin programme on the incidence of epilepsy in an onchocerciasis-endemic area of Mahenge, Tanzania: A population-based prospective study. PLOS Neglected Tropical Diseases, 17(6), e0011178. https://doi.org/10.1371/journal.pntd.0011178
